@@ -65,6 +65,7 @@ def _memory_maze(
     camera_resolution=64,
     seed=None,
     randomize_colors=False,
+    physics_opts=None,
 ):
     random_state = np.random.RandomState(seed)
     walker = RollingBallWithFriction(camera_height=0.3, add_ears=top_camera)
@@ -87,6 +88,8 @@ def _memory_maze(
         random_seed=random_state.randint(2147483648),
     )
 
+    physics_timestep = physics_opts.get('timestep', DEFAULT_PHYSICS_TIMESTEP) if physics_opts else DEFAULT_PHYSICS_TIMESTEP
+
     task = MemoryMazeTask(
         walker=walker,
         maze_arena=arena,
@@ -94,10 +97,18 @@ def _memory_maze(
         target_radius=0.6,
         target_height_above_ground=0.5 if good_visibility else -0.6,
         enable_global_task_observables=True,  # Always add to underlying env, but not always expose in RemapObservationWrapper
+        physics_timestep=physics_timestep,
         control_timestep=1.0 / control_freq,
         camera_resolution=camera_resolution,
         target_randomize_colors=randomize_colors,
     )
+
+    # Apply physics option overrides to MJCF model before compilation
+    if physics_opts:
+        mjcf_option = task.root_entity.mjcf_model.option
+        for key, value in physics_opts.items():
+            if key != 'timestep':  # timestep already handled above
+                setattr(mjcf_option, key, value)
 
     if top_camera:
         task.observables['top_camera'].enabled = True
