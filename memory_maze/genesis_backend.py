@@ -662,6 +662,566 @@ class GenesisMemoryMazeEnv(gym.Env):
 
 
 # ---------------------------------------------------------------------------
+# Phase 5: Batched Scene Builder (GPU-parallel environments)
+# ---------------------------------------------------------------------------
+
+# Deeper hidden depth for batch mode — wider AABB safety margin
+BATCH_HIDDEN_Z = -100.0
+
+
+class BatchGenesisMazeScene:
+    """Manages N parallel Genesis mazes in a single scene.
+
+    Uses ``scene.build(n_envs=N)`` so all environments share the same entity
+    pool but have independent state (positions, velocities, etc.) indexed by
+    ``envs_idx``.  Each env gets its own random maze via
+    ``configure_walls_for_env``.
+
+    The entity layout mirrors ``GenesisMazeScene`` (floor, MAX_WALLS walls,
+    1 walker sphere, n_targets target spheres) but every setter/getter takes
+    an ``envs_idx`` tensor to address individual environments.
+    """
+
+    def __init__(
+        self,
+        n_envs,
+        maze_size=9,
+        n_targets=3,
+        xy_scale=2.0,
+        z_height=1.5,
+        camera_resolution=64,
+        control_timestep=DEFAULT_CONTROL_TIMESTEP,
+        physics_timestep=DEFAULT_PHYSICS_TIMESTEP,
+        max_rooms=6,
+        room_min_size=3,
+        room_max_size=5,
+        target_height_above_ground=-0.6,
+        max_collision_pairs=200,
+    ):
+        assert gs is not None, "Genesis is not installed"
+        assert n_envs >= 1, "n_envs must be >= 1"
+
+        self.n_envs = n_envs
+        self.maze_size = maze_size
+        self.n_targets = n_targets
+        self.xy_scale = xy_scale
+        self.z_height = z_height
+        self.camera_resolution = camera_resolution
+        self.control_timestep = control_timestep
+        self.physics_timestep = physics_timestep
+        self.max_rooms = max_rooms
+        self.room_min_size = room_min_size
+        self.room_max_size = room_max_size
+        self.target_height_above_ground = target_height_above_ground
+
+        self.n_substeps = max(1, int(round(control_timestep / physics_timestep)))
+        self.outer_size = maze_size + 2
+
+        # --- Create scene ---
+        self.scene = gs.Scene(
+            sim_options=gs.options.SimOptions(
+                dt=physics_timestep,
+                substeps=1,
+                gravity=(0.0, 0.0, -9.81),
+            ),
+            rigid_options=gs.options.RigidOptions(
+                enable_collision=True,
+                enable_joint_limit=True,
+                max_collision_pairs=max_collision_pairs,
+            ),
+            vis_options=gs.options.VisOptions(
+                show_world_frame=False,
+            ),
+            renderer=gs.renderers.Rasterizer(),
+        )
+
+        # --- Floor ---
+        self.floor = self.scene.add_entity(
+            morph=gs.morphs.Plane(pos=(0, 0, 0)),
+            material=gs.materials.Rigid(friction=0.5),
+            surface=gs.surfaces.Default(color=(0.4, 0.5, 0.6, 1.0)),
+        )
+
+        # --- Pre-allocate wall pool ---
+        self.wall_entities = []
+        for _ in range(MAX_WALLS):
+            wall = self.scene.add_entity(
+                morph=gs.morphs.Box(
+                    pos=(0, 0, BATCH_HIDDEN_Z),
+                    size=(1, 1, z_height),
+                    fixed=True,
+                ),
+                material=gs.materials.Rigid(friction=0.5),
+                surface=gs.surfaces.Default(color=(0.8, 0.7, 0.3, 1.0)),
+            )
+            self.wall_entities.append(wall)
+
+        # --- Walker ---
+        self.walker = self.scene.add_entity(
+            morph=gs.morphs.Sphere(
+                pos=(0, 0, WALKER_RADIUS),
+                radius=WALKER_RADIUS,
+                fixed=False,
+            ),
+            material=gs.materials.Rigid(
+                friction=0.5,
+                rho=WALKER_TOTAL_MASS / ((4.0 / 3.0) * math.pi * WALKER_RADIUS ** 3),
+            ),
+            surface=gs.surfaces.Default(color=(0.757, 0.757, 0.757, 1.0)),
+        )
+
+        # --- Targets (non-colliding) ---
+        self.target_entities = []
+        self.target_colors = list(TARGET_COLORS)
+        for i in range(n_targets):
+            color = self.target_colors[i]
+            target = self.scene.add_entity(
+                morph=gs.morphs.Sphere(
+                    pos=(0, 0, BATCH_HIDDEN_Z),
+                    radius=TARGET_RADIUS,
+                    fixed=True,
+                    collision=False,
+                ),
+                surface=gs.surfaces.Default(
+                    color=(float(color[0]), float(color[1]), float(color[2]), 1.0),
+                ),
+            )
+            self.target_entities.append(target)
+
+        # --- Per-env cameras (Rasterizer: one camera per env) ---
+        self.cameras = []
+        for i in range(n_envs):
+            cam = self.scene.add_camera(
+                res=(camera_resolution, camera_resolution),
+                pos=(0, 0, WALKER_CAMERA_HEIGHT + WALKER_RADIUS),
+                lookat=(0, 1, WALKER_CAMERA_HEIGHT + WALKER_RADIUS),
+                fov=CAMERA_FOV,
+                near=0.05,
+                far=50.0,
+                env_idx=i,
+            )
+            self.cameras.append(cam)
+
+        self._built = False
+
+    def build(self):
+        """Build the scene with n_envs parallel environments."""
+        self.scene.build(n_envs=self.n_envs)
+        self._built = True
+
+        # Configure walker damping (broadcasts to all envs)
+        damping = np.array([
+            ROLL_DAMPING, ROLL_DAMPING, 0.0,
+            0.0, 0.0, STEER_DAMPING,
+        ])
+        self.walker.set_dofs_damping(damping)
+
+    def configure_walls_for_env(self, env_idx, wall_segments):
+        """Position the wall pool for a single environment.
+
+        Active walls are placed at their maze positions; unused walls are
+        hidden at ``BATCH_HIDDEN_Z``.
+        """
+        idx_tensor = torch.tensor([env_idx], dtype=torch.int32)
+        for i, wall_entity in enumerate(self.wall_entities):
+            if i < len(wall_segments):
+                seg = wall_segments[i]
+                wall_entity.set_pos(
+                    np.array(seg.pos, dtype=np.float32),
+                    envs_idx=idx_tensor,
+                )
+            else:
+                wall_entity.set_pos(
+                    np.array([0.0, 0.0, BATCH_HIDDEN_Z], dtype=np.float32),
+                    envs_idx=idx_tensor,
+                )
+
+    def set_walker_pose(self, env_idx, pos, heading):
+        """Set walker position and heading for a single environment."""
+        idx_tensor = torch.tensor([env_idx], dtype=torch.int32)
+        self.walker.set_pos(
+            np.array([pos[0], pos[1], WALKER_RADIUS], dtype=np.float32),
+            envs_idx=idx_tensor,
+        )
+        qw = math.cos(heading / 2)
+        qz = math.sin(heading / 2)
+        self.walker.set_quat(
+            np.array([qw, 0.0, 0.0, qz], dtype=np.float32),
+            envs_idx=idx_tensor,
+        )
+        self.walker.set_dofs_velocity(
+            np.zeros(6, dtype=np.float32),
+            envs_idx=idx_tensor,
+        )
+
+    def set_target_pos(self, env_idx, target_idx, pos):
+        """Set target sphere position for a single environment."""
+        idx_tensor = torch.tensor([env_idx], dtype=torch.int32)
+        self.target_entities[target_idx].set_pos(
+            np.array(pos, dtype=np.float32),
+            envs_idx=idx_tensor,
+        )
+
+    def hide_target(self, env_idx, target_idx):
+        """Hide a target underground for a single environment."""
+        self.set_target_pos(env_idx, target_idx,
+                            [0.0, 0.0, BATCH_HIDDEN_Z])
+
+    def apply_actions_batched(self, forces_tensor):
+        """Apply DOF forces to the walker across all environments.
+
+        Parameters
+        ----------
+        forces_tensor : array-like, shape (n_envs, 6)
+            Per-environment DOF forces [fx, fy, fz, tx, ty, tz].
+        """
+        self.walker.control_dofs_force(forces_tensor)
+
+    def step(self):
+        """Step physics for one control timestep (all envs advance together)."""
+        for _ in range(self.n_substeps):
+            self.scene.step(update_visualizer=False)
+
+    def get_walker_positions(self):
+        """Get walker positions for all environments.
+
+        Returns
+        -------
+        np.ndarray, shape (n_envs, 3)
+        """
+        pos = self.walker.get_pos()
+        return pos.cpu().numpy() if hasattr(pos, 'cpu') else np.asarray(pos)
+
+    def get_walker_quats(self):
+        """Get walker quaternions for all environments.
+
+        Returns
+        -------
+        np.ndarray, shape (n_envs, 4)
+        """
+        quat = self.walker.get_quat()
+        return quat.cpu().numpy() if hasattr(quat, 'cpu') else np.asarray(quat)
+
+    def update_cameras(self, positions, headings):
+        """Update all per-env cameras to follow their walkers.
+
+        Parameters
+        ----------
+        positions : np.ndarray, shape (n_envs, 3)
+        headings : np.ndarray, shape (n_envs,)
+        """
+        for i in range(self.n_envs):
+            wp = positions[i]
+            h = headings[i]
+            cam_pos = np.array([
+                wp[0], wp[1], wp[2] + WALKER_CAMERA_HEIGHT,
+            ])
+            lookat = np.array([
+                wp[0] + math.cos(h),
+                wp[1] + math.sin(h),
+                wp[2] + WALKER_CAMERA_HEIGHT - 0.1,
+            ])
+            self.cameras[i].set_pose(pos=cam_pos, lookat=lookat)
+
+    def render_all(self):
+        """Render egocentric views for all environments.
+
+        Returns
+        -------
+        np.ndarray, shape (n_envs, H, W, 3), dtype uint8
+        """
+        res = self.camera_resolution
+        images = np.empty((self.n_envs, res, res, 3), dtype=np.uint8)
+        for i in range(self.n_envs):
+            result = self.cameras[i].render(rgb=True, depth=False, segmentation=False)
+            rgb = result[0]
+            if hasattr(rgb, 'cpu'):
+                rgb = rgb.cpu().numpy()
+            images[i] = np.asarray(rgb, dtype=np.uint8)
+        return images
+
+    def render_single(self, env_idx):
+        """Render egocentric view for a single environment.
+
+        Returns
+        -------
+        np.ndarray, shape (H, W, 3), dtype uint8
+        """
+        result = self.cameras[env_idx].render(rgb=True, depth=False, segmentation=False)
+        rgb = result[0]
+        if hasattr(rgb, 'cpu'):
+            rgb = rgb.cpu().numpy()
+        return np.asarray(rgb, dtype=np.uint8)
+
+    def reset_env(self, env_idx):
+        """Reset a single environment to its build-time state."""
+        idx_tensor = torch.tensor([env_idx], dtype=torch.int32)
+        self.scene.reset(envs_idx=idx_tensor)
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Batched Gym-like Vectorized Environment
+# ---------------------------------------------------------------------------
+
+class BatchGenesisMemoryMazeEnv:
+    """Vectorized Memory Maze using a single batched Genesis scene.
+
+    NOT a ``gym.Env`` — exposes a custom vectorized interface where
+    ``reset()`` and ``step()`` operate on all N environments simultaneously.
+
+    Auto-reset convention (matches TorchBeast): when ``done=True`` for env *i*,
+    that env is immediately reset and the returned observation is the **new**
+    episode's first frame.
+    """
+
+    def __init__(
+        self,
+        n_envs,
+        maze_size=9,
+        seed=None,
+        camera_resolution=64,
+        good_visibility=False,
+        control_freq=DEFAULT_CONTROL_FREQ,
+    ):
+        assert gs is not None, "Genesis not installed"
+
+        cfg = MAZE_CONFIGS.get(maze_size, (3, 250, 6, 5))
+        n_targets = cfg[0]
+        time_limit = cfg[1]
+        max_rooms = cfg[2]
+        room_max_size = cfg[3]
+
+        self._n_envs = n_envs
+        self._maze_size = maze_size
+        self._n_targets = n_targets
+        self._camera_resolution = camera_resolution
+
+        control_timestep = 1.0 / control_freq
+        z_height = 0.4 if good_visibility else 1.5
+        target_height = 0.5 if good_visibility else -0.6
+        self._target_height = target_height
+        self._max_steps = int(time_limit * control_freq)
+        self._z_height = z_height
+        self._max_rooms = max_rooms
+        self._room_max_size = room_max_size
+        self._xy_scale = 2.0
+
+        # Per-env RNGs (CPU, for maze generation)
+        base_seed = seed if seed is not None else 0
+        self._rngs = [
+            np.random.RandomState(base_seed + i) for i in range(n_envs)
+        ]
+
+        # Initialize Genesis if needed
+        if not gs._initialized:
+            gs.init(backend=gs.cpu, logging_level='warning')
+
+        # Build batched scene
+        self._scene = BatchGenesisMazeScene(
+            n_envs=n_envs,
+            maze_size=maze_size,
+            n_targets=n_targets,
+            xy_scale=self._xy_scale,
+            z_height=z_height,
+            camera_resolution=camera_resolution,
+            control_timestep=control_timestep,
+            max_rooms=max_rooms,
+            room_max_size=room_max_size,
+            target_height_above_ground=target_height,
+        )
+        self._scene.build()
+
+        # Batched episode state
+        self._step_counts = np.zeros(n_envs, dtype=np.int32)
+        self._walker_headings = np.zeros(n_envs, dtype=np.float64)
+        self._current_target_ix = np.zeros(n_envs, dtype=np.int64)
+        self._targets_obtained = np.zeros(n_envs, dtype=np.int32)
+        # (n_envs, n_targets, 3) — world positions of placed targets
+        self._target_positions = np.zeros(
+            (n_envs, n_targets, 3), dtype=np.float64
+        )
+
+    @property
+    def n_envs(self):
+        return self._n_envs
+
+    def reset(self):
+        """Reset all environments. Returns observations (n_envs, H, W, 3)."""
+        for i in range(self._n_envs):
+            self._reset_single_env(i)
+
+        # Update cameras and render
+        positions = self._scene.get_walker_positions()
+        self._scene.update_cameras(positions, self._walker_headings)
+        images = self._scene.render_all()
+
+        # Draw target borders
+        for i in range(self._n_envs):
+            self._draw_border(images[i], self._current_target_ix[i])
+
+        return images
+
+    def step(self, actions):
+        """Execute one step for all environments.
+
+        Parameters
+        ----------
+        actions : array-like, shape (n_envs,)
+            Discrete action indices (0-5) per environment.
+
+        Returns
+        -------
+        obs : np.ndarray, shape (n_envs, H, W, 3), dtype uint8
+        rewards : np.ndarray, shape (n_envs,), dtype float32
+        dones : np.ndarray, shape (n_envs,), dtype bool
+        infos : list[dict]
+        """
+        actions = np.asarray(actions, dtype=np.int64)
+
+        # 1. Map discrete actions to continuous [roll, steer]
+        continuous = np.array([ACTION_SET[a] for a in actions])  # (n_envs, 2)
+
+        # 2. Compute heading-rotated forces for all envs
+        forces = np.zeros((self._n_envs, 6), dtype=np.float64)
+        cos_h = np.cos(self._walker_headings)
+        sin_h = np.sin(self._walker_headings)
+        roll_forces = ROLL_GEAR * continuous[:, 0]  # (n_envs,)
+        forces[:, 0] = roll_forces * cos_h
+        forces[:, 1] = roll_forces * sin_h
+        forces[:, 5] = STEER_GEAR * continuous[:, 1]
+
+        # 3. Apply forces and step physics
+        self._scene.apply_actions_batched(forces.astype(np.float32))
+        self._scene.step()
+
+        # 4. Extract headings from quaternions (vectorized)
+        quats = self._scene.get_walker_quats()  # (n_envs, 4)
+        self._walker_headings = np.arctan2(
+            2 * (quats[:, 0] * quats[:, 3] + quats[:, 1] * quats[:, 2]),
+            1 - 2 * (quats[:, 2] ** 2 + quats[:, 3] ** 2),
+        )
+
+        # 5. Check target contacts (vectorized distance computation)
+        positions = self._scene.get_walker_positions()  # (n_envs, 3)
+        rewards = np.zeros(self._n_envs, dtype=np.float32)
+        for i in range(self._n_envs):
+            for t in range(self._n_targets):
+                tpos = self._target_positions[i, t]
+                if tpos[2] < -5:  # hidden
+                    continue
+                dist = np.linalg.norm(positions[i, :2] - tpos[:2])
+                if dist < TARGET_ACTIVATION_GAP and t == self._current_target_ix[i]:
+                    rewards[i] = 1.0
+                    self._targets_obtained[i] += 1
+                    self._pick_new_target(i)
+
+        # 6. Update cameras and render
+        self._scene.update_cameras(positions, self._walker_headings)
+        images = self._scene.render_all()
+
+        # 7. Draw borders
+        for i in range(self._n_envs):
+            self._draw_border(images[i], self._current_target_ix[i])
+
+        # 8. Check dones and auto-reset
+        self._step_counts += 1
+        dones = self._step_counts >= self._max_steps
+
+        infos = [{} for _ in range(self._n_envs)]
+        for i in range(self._n_envs):
+            if dones[i]:
+                infos[i]['TimeLimit.truncated'] = True
+                infos[i]['targets_obtained'] = int(self._targets_obtained[i])
+                # Auto-reset: reset env and return new episode's first obs
+                self._reset_single_env(i)
+                # Re-render this env after reset
+                wp = self._scene.get_walker_positions()
+                self._scene.update_cameras(wp, self._walker_headings)
+                images[i] = self._scene.render_single(i)
+                self._draw_border(images[i], self._current_target_ix[i])
+
+        return images, rewards, dones, infos
+
+    def _reset_single_env(self, env_idx):
+        """Reset a single environment: new maze, walker, targets."""
+        rng = self._rngs[env_idx]
+
+        # Reset Genesis state for this env
+        self._scene.reset_env(env_idx)
+
+        # Generate new maze
+        seed = rng.randint(2147483648)
+        maze = labmaze.RandomMaze(
+            height=self._scene.outer_size,
+            width=self._scene.outer_size,
+            max_rooms=self._max_rooms,
+            room_min_size=3,
+            room_max_size=self._room_max_size,
+            spawns_per_room=1,
+            objects_per_room=1,
+            random_seed=seed,
+        )
+
+        # Configure walls
+        wall_segments = extract_wall_segments(maze, self._xy_scale, self._z_height)
+        self._scene.configure_walls_for_env(env_idx, wall_segments)
+
+        # Place walker
+        spawn_positions = extract_positions(maze, 'P', self._xy_scale)
+        if spawn_positions:
+            spawn_pos = spawn_positions[rng.randint(len(spawn_positions))]
+        else:
+            spawn_pos = np.array([0.0, 0.0, 0.0])
+
+        heading = rng.uniform(0, 2 * math.pi)
+        self._walker_headings[env_idx] = heading
+        self._scene.set_walker_pose(env_idx, spawn_pos, heading)
+
+        # Place targets
+        target_positions = extract_positions(maze, 'G', self._xy_scale)
+        rng.shuffle(target_positions)
+        target_z = TARGET_RADIUS + self._target_height
+        for t in range(self._n_targets):
+            if t < len(target_positions):
+                tpos = target_positions[t]
+                world_pos = np.array([tpos[0], tpos[1], target_z])
+                self._scene.set_target_pos(env_idx, t, world_pos)
+                self._target_positions[env_idx, t] = world_pos
+            else:
+                self._scene.hide_target(env_idx, t)
+                self._target_positions[env_idx, t] = [0.0, 0.0, BATCH_HIDDEN_Z]
+
+        # Reset counters
+        self._step_counts[env_idx] = 0
+        self._targets_obtained[env_idx] = 0
+        self._current_target_ix[env_idx] = rng.randint(self._n_targets)
+
+    def _pick_new_target(self, env_idx):
+        """Pick a new random target for an environment (not the current one)."""
+        rng = self._rngs[env_idx]
+        current = self._current_target_ix[env_idx]
+        while True:
+            ix = rng.randint(self._n_targets)
+            if ix != current:
+                self._current_target_ix[env_idx] = ix
+                break
+
+    def _draw_border(self, img, target_ix):
+        """Draw target color border on an image (in-place)."""
+        color = TARGET_COLORS[target_ix]
+        B = int(2 * math.sqrt(self._camera_resolution / 64))
+        border_color = (color * 255 * 0.7).astype(np.uint8)
+        img[:, :B] = border_color
+        img[:, -B:] = border_color
+        img[:B, :] = border_color
+        img[-B:, :] = border_color
+
+    def close(self):
+        """Clean up resources."""
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Gym environment registration helper
 # ---------------------------------------------------------------------------
 
