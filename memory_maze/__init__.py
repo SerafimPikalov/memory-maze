@@ -63,9 +63,11 @@ except ImportError:
     print('memory_maze: gym environments not registered.')
     raise
 
-# Register Genesis-backed environments (separate try block — Genesis is optional)
+# Register Genesis-backed environments (separate try block — Genesis is optional).
+# Catch AttributeError too: on headless Linux without X11, pyglet raises
+# AttributeError('NoneType' ... 'XRenderFindVisualFormat') during import.
 try:
     from .genesis_backend import register_genesis_envs
     register_genesis_envs()
-except ImportError:
-    pass  # Genesis not installed, skip registration
+except (ImportError, AttributeError):
+    pass  # Genesis not installed or display unavailable, skip registration

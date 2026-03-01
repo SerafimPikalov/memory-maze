@@ -34,6 +34,21 @@ except ImportError:
     gym = None
     spaces = None
 
+# BatchRenderer (Madrona) availability detection — CUDA-only, Linux x86-64
+try:
+    import gs_madrona
+    _BATCH_RENDERER_AVAILABLE = True
+except ImportError:
+    _BATCH_RENDERER_AVAILABLE = False
+
+
+def _use_batch_renderer():
+    """Use BatchRenderer when gs_madrona is installed and CUDA backend is active."""
+    return (_BATCH_RENDERER_AVAILABLE
+            and gs is not None
+            and gs._initialized
+            and gs.device.type == 'cuda')
+
 # ---------------------------------------------------------------------------
 # Constants from the MuJoCo reference implementation (maze.py, tasks.py)
 # ---------------------------------------------------------------------------
@@ -196,6 +211,11 @@ class GenesisMazeScene:
         self.outer_size = maze_size + 2
 
         # Create Genesis scene
+        if _use_batch_renderer():
+            renderer = gs.renderers.BatchRenderer(use_rasterizer=True)
+        else:
+            renderer = gs.renderers.Rasterizer()
+
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(
                 dt=physics_timestep,
@@ -209,8 +229,15 @@ class GenesisMazeScene:
             vis_options=gs.options.VisOptions(
                 show_world_frame=False,
             ),
-            renderer=gs.renderers.Rasterizer(),
+            renderer=renderer,
         )
+
+        # BatchRenderer requires explicit lights (Rasterizer uses default OpenGL lighting)
+        if _use_batch_renderer():
+            self.scene.add_light(
+                pos=(0, 0, 10), dir=(0, 0, -1),
+                directional=True, intensity=1.0, color=(1.0, 1.0, 1.0),
+            )
 
         # --- Floor ---
         self.floor = self.scene.add_entity(
@@ -542,6 +569,8 @@ class GenesisMemoryMazeEnv(gym.Env):
         self._rng = np.random.RandomState(seed)
 
         # Initialize Genesis (skip if already initialized)
+        # Single-env mode is used by forked actor processes — CUDA can't be
+        # reinitialized in forked subprocesses, so always use CPU backend.
         if not gs._initialized:
             gs.init(backend=gs.cpu, logging_level='warning')
 
@@ -718,6 +747,11 @@ class BatchGenesisMazeScene:
         self.outer_size = maze_size + 2
 
         # --- Create scene ---
+        if _use_batch_renderer():
+            renderer = gs.renderers.BatchRenderer(use_rasterizer=True)
+        else:
+            renderer = gs.renderers.Rasterizer()
+
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(
                 dt=physics_timestep,
@@ -731,9 +765,17 @@ class BatchGenesisMazeScene:
             ),
             vis_options=gs.options.VisOptions(
                 show_world_frame=False,
+                env_separate_rigid=not _use_batch_renderer(),
             ),
-            renderer=gs.renderers.Rasterizer(),
+            renderer=renderer,
         )
+
+        # BatchRenderer requires explicit lights (Rasterizer uses default OpenGL lighting)
+        if _use_batch_renderer():
+            self.scene.add_light(
+                pos=(0, 0, 10), dir=(0, 0, -1),
+                directional=True, intensity=1.0, color=(1.0, 1.0, 1.0),
+            )
 
         # --- Floor ---
         self.floor = self.scene.add_entity(
@@ -788,19 +830,29 @@ class BatchGenesisMazeScene:
             )
             self.target_entities.append(target)
 
-        # --- Per-env cameras (Rasterizer: one camera per env) ---
-        self.cameras = []
-        for i in range(n_envs):
-            cam = self.scene.add_camera(
+        # --- Cameras ---
+        if _use_batch_renderer():
+            # BatchRenderer: one camera renders all envs simultaneously
+            self.camera = self.scene.add_camera(
                 res=(camera_resolution, camera_resolution),
                 pos=(0, 0, WALKER_CAMERA_HEIGHT + WALKER_RADIUS),
                 lookat=(0, 1, WALKER_CAMERA_HEIGHT + WALKER_RADIUS),
-                fov=CAMERA_FOV,
-                near=0.05,
-                far=50.0,
-                env_idx=i,
+                fov=CAMERA_FOV, near=0.05, far=50.0,
             )
-            self.cameras.append(cam)
+            self.cameras = None  # Signal: using batch renderer
+        else:
+            # Rasterizer: per-env cameras with env_idx binding
+            self.camera = None
+            self.cameras = []
+            for i in range(n_envs):
+                cam = self.scene.add_camera(
+                    res=(camera_resolution, camera_resolution),
+                    pos=(0, 0, WALKER_CAMERA_HEIGHT + WALKER_RADIUS),
+                    lookat=(0, 1, WALKER_CAMERA_HEIGHT + WALKER_RADIUS),
+                    fov=CAMERA_FOV, near=0.05, far=50.0,
+                    env_idx=i,
+                )
+                self.cameras.append(cam)
 
         self._built = False
 
@@ -910,18 +962,26 @@ class BatchGenesisMazeScene:
         positions : np.ndarray, shape (n_envs, 3)
         headings : np.ndarray, shape (n_envs,)
         """
-        for i in range(self.n_envs):
-            wp = positions[i]
-            h = headings[i]
-            cam_pos = np.array([
-                wp[0], wp[1], wp[2] + WALKER_CAMERA_HEIGHT,
-            ])
-            lookat = np.array([
-                wp[0] + math.cos(h),
-                wp[1] + math.sin(h),
-                wp[2] + WALKER_CAMERA_HEIGHT - 0.1,
-            ])
-            self.cameras[i].set_pose(pos=cam_pos, lookat=lookat)
+        cam_positions = np.stack([
+            positions[:, 0],
+            positions[:, 1],
+            positions[:, 2] + WALKER_CAMERA_HEIGHT,
+        ], axis=-1)  # (n_envs, 3)
+
+        look_dist = 1.0
+        looktats = np.stack([
+            positions[:, 0] + look_dist * np.cos(headings),
+            positions[:, 1] + look_dist * np.sin(headings),
+            positions[:, 2] + WALKER_CAMERA_HEIGHT - 0.1,
+        ], axis=-1)  # (n_envs, 3)
+
+        if self.camera is not None:
+            # BatchRenderer: single vectorized call
+            self.camera.set_pose(pos=cam_positions, lookat=looktats)
+        else:
+            # Rasterizer: per-env loop
+            for i in range(self.n_envs):
+                self.cameras[i].set_pose(pos=cam_positions[i], lookat=looktats[i])
 
     def render_all(self):
         """Render egocentric views for all environments.
@@ -930,15 +990,21 @@ class BatchGenesisMazeScene:
         -------
         np.ndarray, shape (n_envs, H, W, 3), dtype uint8
         """
-        res = self.camera_resolution
-        images = np.empty((self.n_envs, res, res, 3), dtype=np.uint8)
-        for i in range(self.n_envs):
-            result = self.cameras[i].render(rgb=True, depth=False, segmentation=False)
-            rgb = result[0]
-            if hasattr(rgb, 'cpu'):
-                rgb = rgb.cpu().numpy()
-            images[i] = np.asarray(rgb, dtype=np.uint8)
-        return images
+        if self.camera is not None:
+            # BatchRenderer: one call returns (n_envs, H, W, 3) CUDA tensor
+            rgb = self.camera.render(rgb=True, depth=False, segmentation=False)[0]
+            return rgb.cpu().numpy().astype(np.uint8)
+        else:
+            # Rasterizer: sequential per-env loop
+            res = self.camera_resolution
+            images = np.empty((self.n_envs, res, res, 3), dtype=np.uint8)
+            for i in range(self.n_envs):
+                result = self.cameras[i].render(rgb=True, depth=False, segmentation=False)
+                rgb = result[0]
+                if hasattr(rgb, 'cpu'):
+                    rgb = rgb.cpu().numpy()
+                images[i] = np.asarray(rgb, dtype=np.uint8)
+            return images
 
     def render_single(self, env_idx):
         """Render egocentric view for a single environment.
@@ -947,11 +1013,17 @@ class BatchGenesisMazeScene:
         -------
         np.ndarray, shape (H, W, 3), dtype uint8
         """
-        result = self.cameras[env_idx].render(rgb=True, depth=False, segmentation=False)
-        rgb = result[0]
-        if hasattr(rgb, 'cpu'):
-            rgb = rgb.cpu().numpy()
-        return np.asarray(rgb, dtype=np.uint8)
+        if self.camera is not None:
+            # BatchRenderer: render all, extract one
+            rgb = self.camera.render(rgb=True, depth=False, segmentation=False)[0]
+            return rgb[env_idx].cpu().numpy().astype(np.uint8)
+        else:
+            # Rasterizer: render specific camera
+            result = self.cameras[env_idx].render(rgb=True, depth=False, segmentation=False)
+            rgb = result[0]
+            if hasattr(rgb, 'cpu'):
+                rgb = rgb.cpu().numpy()
+            return np.asarray(rgb, dtype=np.uint8)
 
     def reset_env(self, env_idx):
         """Reset a single environment to its build-time state."""
@@ -1014,7 +1086,8 @@ class BatchGenesisMemoryMazeEnv:
 
         # Initialize Genesis if needed
         if not gs._initialized:
-            gs.init(backend=gs.cpu, logging_level='warning')
+            backend = gs.cuda if _BATCH_RENDERER_AVAILABLE else gs.cpu
+            gs.init(backend=backend, logging_level='warning')
 
         # Build batched scene
         self._scene = BatchGenesisMazeScene(
