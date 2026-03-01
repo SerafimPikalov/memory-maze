@@ -62,3 +62,10 @@ try:
 except ImportError:
     print('memory_maze: gym environments not registered.')
     raise
+
+# Register Genesis-backed environments (separate try block — Genesis is optional)
+try:
+    from .genesis_backend import register_genesis_envs
+    register_genesis_envs()
+except ImportError:
+    pass  # Genesis not installed, skip registration
