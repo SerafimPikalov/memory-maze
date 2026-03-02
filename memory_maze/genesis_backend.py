@@ -97,8 +97,8 @@ DEFAULT_CONTROL_FREQ = 4.0
 DEFAULT_PHYSICS_TIMESTEP = 0.005
 DEFAULT_CONTROL_TIMESTEP = 1.0 / DEFAULT_CONTROL_FREQ  # 0.25s
 
-# Max pre-allocated walls (covers 15x15 mazes generously)
-MAX_WALLS = 64
+# Max pre-allocated walls (one per maze wall cell; 15x15 outer grid = 17x17 = 289 cells max)
+MAX_WALLS = 225
 
 # Maze config per size (maze_size -> (n_targets, time_limit, max_rooms, room_max_size))
 MAZE_CONFIGS = {
@@ -150,6 +150,33 @@ def extract_wall_segments(maze, xy_scale=2.0, z_height=1.5):
             segments.append(WallSegment(pos=pos, half_size=half_size))
 
     return segments
+
+
+def extract_wall_cells(maze, xy_scale=2.0, z_height=1.5):
+    """Extract one WallSegment per wall cell from the maze grid.
+
+    Unlike ``extract_wall_segments`` which merges adjacent wall cells into
+    larger boxes (variable sizes), this returns one identically-sized box per
+    wall cell.  All boxes have half_size = (xy_scale/2, xy_scale/2, z_height/2)
+    so they can share a single pre-allocated Genesis entity size.
+    """
+    x_offset = (maze.width - 1) / 2.0
+    y_offset = (maze.height - 1) / 2.0
+    half = np.array([xy_scale / 2.0, xy_scale / 2.0, z_height / 2.0])
+
+    cells = []
+    for row in range(maze.height):
+        for col in range(maze.width):
+            c = maze.entity_layer[row, col]
+            if c not in (' ', 'P', 'G'):
+                # Wall cell — compute world position (same coord transform as extract_wall_segments)
+                pos = np.array([
+                    (col - x_offset) * xy_scale,
+                    -(row - y_offset) * xy_scale,
+                    z_height / 2.0,
+                ])
+                cells.append(WallSegment(pos=pos, half_size=half))
+    return cells
 
 
 def extract_positions(maze, token, xy_scale=2.0):
@@ -246,13 +273,13 @@ class GenesisMazeScene:
             surface=gs.surfaces.Default(color=(0.4, 0.5, 0.6, 1.0)),
         )
 
-        # --- Pre-allocate wall entities ---
+        # --- Pre-allocate wall entities (one per maze wall cell, all same size) ---
         self.wall_entities = []
         for i in range(MAX_WALLS):
             wall = self.scene.add_entity(
                 morph=gs.morphs.Box(
                     pos=(0, 0, -10),  # Start underground
-                    size=(1, 1, z_height),  # Will be resized per maze
+                    size=(xy_scale, xy_scale, z_height),  # Uniform per-cell size
                     fixed=True,
                 ),
                 material=gs.materials.Rigid(friction=0.5),
@@ -339,8 +366,8 @@ class GenesisMazeScene:
             random_seed=seed,
         )
 
-        # Configure walls
-        wall_segments = extract_wall_segments(self._maze, self.xy_scale, self.z_height)
+        # Configure walls (one entity per maze wall cell, uniform size)
+        wall_segments = extract_wall_cells(self._maze, self.xy_scale, self.z_height)
         self._configure_walls(wall_segments)
 
         # Place walker at random spawn
@@ -651,10 +678,13 @@ class GenesisMemoryMazeEnv(gym.Env):
         return obs, reward, done, info
 
     def _pick_new_target(self):
-        """Pick a new random target (not the one currently being touched)."""
+        """Pick a new random target that is not within activation distance of the walker."""
+        walker_pos = self._scene.get_walker_position()
         while True:
             ix = self._rng.randint(self._n_targets)
-            if ix != self._current_target_ix:
+            tpos = self._target_world_positions[ix]
+            dist = np.linalg.norm(walker_pos[:2] - tpos[:2])
+            if dist >= TARGET_ACTIVATION_GAP:
                 self._current_target_ix = ix
                 break
 
@@ -784,13 +814,13 @@ class BatchGenesisMazeScene:
             surface=gs.surfaces.Default(color=(0.4, 0.5, 0.6, 1.0)),
         )
 
-        # --- Pre-allocate wall pool ---
+        # --- Pre-allocate wall pool (one per maze wall cell, uniform size) ---
         self.wall_entities = []
         for _ in range(MAX_WALLS):
             wall = self.scene.add_entity(
                 morph=gs.morphs.Box(
                     pos=(0, 0, BATCH_HIDDEN_Z),
-                    size=(1, 1, z_height),
+                    size=(xy_scale, xy_scale, z_height),  # Uniform per-cell size
                     fixed=True,
                 ),
                 material=gs.materials.Rigid(friction=0.5),
@@ -1026,9 +1056,15 @@ class BatchGenesisMazeScene:
             return np.asarray(rgb, dtype=np.uint8)
 
     def reset_env(self, env_idx):
-        """Reset a single environment to its build-time state."""
+        """Reset a single environment to its build-time state.
+
+        Preserves the global simulation time counter ``scene._t`` so that
+        resetting one env doesn't rewind the clock for all other envs.
+        """
         idx_tensor = torch.tensor([env_idx], dtype=torch.int32)
+        saved_t = self.scene._t
         self.scene.reset(envs_idx=idx_tensor)
+        self.scene._t = saved_t
 
 
 # ---------------------------------------------------------------------------
@@ -1235,8 +1271,8 @@ class BatchGenesisMemoryMazeEnv:
             random_seed=seed,
         )
 
-        # Configure walls
-        wall_segments = extract_wall_segments(maze, self._xy_scale, self._z_height)
+        # Configure walls (one entity per maze wall cell, uniform size)
+        wall_segments = extract_wall_cells(maze, self._xy_scale, self._z_height)
         self._scene.configure_walls_for_env(env_idx, wall_segments)
 
         # Place walker
@@ -1270,12 +1306,14 @@ class BatchGenesisMemoryMazeEnv:
         self._current_target_ix[env_idx] = rng.randint(self._n_targets)
 
     def _pick_new_target(self, env_idx):
-        """Pick a new random target for an environment (not the current one)."""
+        """Pick a new random target for an environment (not within activation distance)."""
         rng = self._rngs[env_idx]
-        current = self._current_target_ix[env_idx]
+        walker_pos = self._scene.get_walker_positions()[env_idx]  # (3,)
         while True:
             ix = rng.randint(self._n_targets)
-            if ix != current:
+            tpos = self._target_positions[env_idx, ix]
+            dist = np.linalg.norm(walker_pos[:2] - tpos[:2])
+            if dist >= TARGET_ACTIVATION_GAP:
                 self._current_target_ix[env_idx] = ix
                 break
 
