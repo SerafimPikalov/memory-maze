@@ -90,7 +90,7 @@ CAMERA_FOV = 80  # fovy from XML
 
 # Target detection
 TARGET_RADIUS = 0.6
-TARGET_ACTIVATION_GAP = 2 * TARGET_RADIUS  # gap=2*radius in MuJoCo target_sphere
+TARGET_ACTIVATION_GAP = WALKER_RADIUS + TARGET_RADIUS  # 0.8m center-to-center, matches MuJoCo contact detection
 
 # Timing
 DEFAULT_CONTROL_FREQ = 4.0
