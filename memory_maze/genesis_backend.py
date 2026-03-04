@@ -98,12 +98,27 @@ DEFAULT_CONTROL_FREQ = 4.0
 DEFAULT_PHYSICS_TIMESTEP = 0.005
 DEFAULT_CONTROL_TIMESTEP = 1.0 / DEFAULT_CONTROL_FREQ  # 0.25s
 
-# Max pre-allocated walls (one per maze wall cell; 15x15 outer grid = 17x17 = 289 cells max)
-MAX_WALLS = 225
-
 # Texture support
 N_WALL_GROUPS = 9   # '0'-'8' spatial blocks from TextMazeVaryingWalls
-WALLS_PER_GROUP = MAX_WALLS // N_WALL_GROUPS  # 25
+
+
+def _compute_walls_per_group(maze_size):
+    """Compute max walls per texture group for a given maze size.
+
+    The 3x3 block division of the outer grid (maze_size+2) produces unequal
+    blocks — corner/edge blocks include exterior walls and can have more cells
+    than the average.  We use the actual worst-case block size.
+    """
+    outer = maze_size + 2
+    # Largest block span in the 3x3 grid (last block gets remainder)
+    max_span = outer - 2 * (outer // 3)  # ceiling division remainder
+    # Worst case: every cell in the largest block is a wall
+    return max_span * max_span
+
+
+def _max_walls(maze_size):
+    """Total pre-allocated walls = per_group * N_WALL_GROUPS."""
+    return _compute_walls_per_group(maze_size) * N_WALL_GROUPS
 BOX_OBJ_PATH = os.path.join(os.path.dirname(__file__), 'assets', 'textured_box.obj')
 
 # Maze config per size (maze_size -> (n_targets, time_limit, max_rooms, room_max_size))
@@ -346,6 +361,8 @@ class GenesisMazeScene:
         )
 
         # --- Pre-allocate wall entities ---
+        walls_per_group = _compute_walls_per_group(maze_size)
+        max_walls = walls_per_group * N_WALL_GROUPS
         if use_textures:
             # Load all wall textures and assign one per group
             all_wall_textures = _load_wall_textures()
@@ -362,7 +379,7 @@ class GenesisMazeScene:
                     diffuse_texture=gs.textures.ImageTexture(image_array=tex_array),
                 )
                 group_entities = []
-                for _ in range(WALLS_PER_GROUP):
+                for _ in range(walls_per_group):
                     wall = self.scene.add_entity(
                         morph=gs.morphs.Mesh(
                             file=BOX_OBJ_PATH,
@@ -382,7 +399,7 @@ class GenesisMazeScene:
         else:
             self._wall_groups = None
             self.wall_entities = []
-            for _ in range(MAX_WALLS):
+            for _ in range(max_walls):
                 wall = self.scene.add_entity(
                     morph=gs.morphs.Box(
                         pos=(0, 0, -10),
@@ -460,20 +477,24 @@ class GenesisMazeScene:
         """Reset the scene: regenerate maze, place walker and targets."""
         assert self._built, "Scene must be built before reset"
 
-        # Generate new maze
-        seed = rng.randint(2147483648)
-        self._maze = labmaze.RandomMaze(
-            height=self.outer_size,
-            width=self.outer_size,
-            max_rooms=self.max_rooms,
-            room_min_size=self.room_min_size,
-            room_max_size=self.room_max_size,
-            spawns_per_room=1,
-            objects_per_room=1,
-            random_seed=seed,
-        )
+        # Create maze once, then regenerate on each reset (matches MuJoCo lifecycle)
+        if self._maze is None:
+            seed = rng.randint(2147483648)
+            self._maze = labmaze.RandomMaze(
+                height=self.outer_size,
+                width=self.outer_size,
+                max_rooms=self.max_rooms,
+                room_min_size=self.room_min_size,
+                room_max_size=self.room_max_size,
+                spawns_per_room=1,
+                objects_per_room=1,
+                random_seed=seed,
+            )
+        self._maze.regenerate()
         if self.use_textures:
             _apply_block_variations(self._maze)
+            # Shuffle texture-to-region mapping each episode (matches MuJoCo)
+            self.shuffle_wall_textures(rng)
 
         # Configure walls (one entity per maze wall cell, uniform size)
         wall_segments = extract_wall_cells(self._maze, self.xy_scale, self.z_height)
@@ -514,6 +535,20 @@ class GenesisMazeScene:
 
         # Update camera to walker position
         self._update_camera()
+
+    def shuffle_wall_textures(self, rng):
+        """Randomly permute texture-to-region mapping each episode.
+
+        MuJoCo re-randomizes wall textures every episode via rng.choice().
+        Genesis pre-allocates textured entity groups at init, so we shuffle
+        which group key maps to which entity list instead.
+        """
+        if self._wall_groups is None:
+            return
+        keys = sorted(self._wall_groups.keys())
+        groups = [self._wall_groups[k] for k in keys]
+        rng.shuffle(groups)
+        self._wall_groups = dict(zip(keys, groups))
 
     def _configure_walls(self, wall_segments):
         """Reposition pre-allocated wall entities for the current maze layout."""
@@ -863,7 +898,7 @@ class BatchGenesisMazeScene:
     ``envs_idx``.  Each env gets its own random maze via
     ``configure_walls_for_env``.
 
-    The entity layout mirrors ``GenesisMazeScene`` (floor, MAX_WALLS walls,
+    The entity layout mirrors ``GenesisMazeScene`` (floor, walls pool,
     1 walker sphere, n_targets target spheres) but every setter/getter takes
     an ``envs_idx`` tensor to address individual environments.
     """
@@ -961,6 +996,8 @@ class BatchGenesisMazeScene:
         )
 
         # --- Pre-allocate wall pool ---
+        walls_per_group = _compute_walls_per_group(maze_size)
+        max_walls = walls_per_group * N_WALL_GROUPS
         if use_textures:
             all_wall_textures = _load_wall_textures()
             texture_names = list(all_wall_textures.keys())
@@ -975,7 +1012,7 @@ class BatchGenesisMazeScene:
                     diffuse_texture=gs.textures.ImageTexture(image_array=tex_array),
                 )
                 group_entities = []
-                for _ in range(WALLS_PER_GROUP):
+                for _ in range(walls_per_group):
                     wall = self.scene.add_entity(
                         morph=gs.morphs.Mesh(
                             file=BOX_OBJ_PATH,
@@ -995,7 +1032,7 @@ class BatchGenesisMazeScene:
         else:
             self._wall_groups = None
             self.wall_entities = []
-            for _ in range(MAX_WALLS):
+            for _ in range(max_walls):
                 wall = self.scene.add_entity(
                     morph=gs.morphs.Box(
                         pos=(0, 0, BATCH_HIDDEN_Z),
@@ -1077,23 +1114,38 @@ class BatchGenesisMazeScene:
         ])
         self.walker.set_dofs_damping(damping)
 
-    def configure_walls_for_env(self, env_idx, wall_segments):
+    def shuffled_wall_groups(self, rng):
+        """Return a shuffled copy of wall_groups (does not mutate shared state)."""
+        if self._wall_groups is None:
+            return None
+        keys = sorted(self._wall_groups.keys())
+        groups = [self._wall_groups[k] for k in keys]
+        rng.shuffle(groups)
+        return dict(zip(keys, groups))
+
+    def configure_walls_for_env(self, env_idx, wall_segments, wall_groups=None):
         """Position the wall pool for a single environment.
 
         Active walls are placed at their maze positions; unused walls are
         hidden at ``BATCH_HIDDEN_Z``.
+
+        Parameters
+        ----------
+        wall_groups : dict, optional
+            Override texture-to-region mapping (used for per-env shuffling).
         """
         idx_tensor = torch.tensor([env_idx], dtype=torch.int32)
         hidden_pos = np.array([0.0, 0.0, BATCH_HIDDEN_Z], dtype=np.float32)
+        groups = wall_groups or self._wall_groups
 
-        if self._wall_groups is not None:
+        if groups is not None:
             # Textured mode: assign walls to correct texture group
-            group_usage = {char: 0 for char in self._wall_groups}
+            group_usage = {char: 0 for char in groups}
             for seg in wall_segments:
                 char = seg.wall_char
-                if char not in self._wall_groups:
+                if char not in groups:
                     continue
-                group = self._wall_groups[char]
+                group = groups[char]
                 idx = group_usage[char]
                 if idx < len(group):
                     group[idx].set_pos(
@@ -1102,7 +1154,7 @@ class BatchGenesisMazeScene:
                     )
                     group_usage[char] += 1
             # Hide unused walls
-            for char, group in self._wall_groups.items():
+            for char, group in groups.items():
                 for i in range(group_usage[char], len(group)):
                     group[i].set_pos(hidden_pos, envs_idx=idx_tensor)
         else:
@@ -1342,6 +1394,9 @@ class BatchGenesisMemoryMazeEnv:
         )
         self._scene.build()
 
+        # Per-env persistent maze objects (created on first reset, then regenerated)
+        self._mazes = [None] * n_envs
+
         # Batched episode state
         self._step_counts = np.zeros(n_envs, dtype=np.int32)
         self._walker_headings = np.zeros(n_envs, dtype=np.float64)
@@ -1460,24 +1515,31 @@ class BatchGenesisMemoryMazeEnv:
         # Reset Genesis state for this env
         self._scene.reset_env(env_idx)
 
-        # Generate new maze
-        seed = rng.randint(2147483648)
-        maze = labmaze.RandomMaze(
-            height=self._scene.outer_size,
-            width=self._scene.outer_size,
-            max_rooms=self._max_rooms,
-            room_min_size=3,
-            room_max_size=self._room_max_size,
-            spawns_per_room=1,
-            objects_per_room=1,
-            random_seed=seed,
-        )
+        # Create maze once per env, then regenerate (matches MuJoCo lifecycle)
+        if self._mazes[env_idx] is None:
+            seed = rng.randint(2147483648)
+            self._mazes[env_idx] = labmaze.RandomMaze(
+                height=self._scene.outer_size,
+                width=self._scene.outer_size,
+                max_rooms=self._max_rooms,
+                room_min_size=3,
+                room_max_size=self._room_max_size,
+                spawns_per_room=1,
+                objects_per_room=1,
+                random_seed=seed,
+            )
+        maze = self._mazes[env_idx]
+        maze.regenerate()
         if self._scene.use_textures:
             _apply_block_variations(maze)
+            # Shuffle texture-to-region mapping per env (doesn't mutate shared state)
+            shuffled = self._scene.shuffled_wall_groups(rng)
+        else:
+            shuffled = None
 
         # Configure walls (one entity per maze wall cell, uniform size)
         wall_segments = extract_wall_cells(maze, self._xy_scale, self._z_height)
-        self._scene.configure_walls_for_env(env_idx, wall_segments)
+        self._scene.configure_walls_for_env(env_idx, wall_segments, wall_groups=shuffled)
 
         # Place walker
         spawn_positions = extract_positions(maze, 'P', self._xy_scale)
