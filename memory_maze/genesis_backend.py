@@ -311,15 +311,24 @@ class GenesisMazeScene:
             ),
             vis_options=gs.options.VisOptions(
                 show_world_frame=False,
+                ambient_light=(0.3, 0.3, 0.3),
+                lights=[
+                    {"type": "directional", "dir": (0, 0, -1), "color": (1.0, 1.0, 1.0), "intensity": 5.0},
+                    {"type": "directional", "dir": (-1, -1, -1), "color": (1.0, 1.0, 1.0), "intensity": 3.0},
+                ],
             ),
             renderer=renderer,
         )
 
-        # BatchRenderer requires explicit lights (Rasterizer uses default OpenGL lighting)
+        # BatchRenderer requires explicit lights (Rasterizer uses VisOptions.lights)
         if _use_batch_renderer():
             self.scene.add_light(
                 pos=(0, 0, 10), dir=(0, 0, -1),
-                directional=True, intensity=1.0, color=(1.0, 1.0, 1.0),
+                directional=True, intensity=5.0, color=(1.0, 1.0, 1.0),
+            )
+            self.scene.add_light(
+                pos=(0, 0, 10), dir=(-1, -1, -1),
+                directional=True, intensity=3.0, color=(1.0, 1.0, 1.0),
             )
 
         # --- Floor ---
@@ -604,7 +613,7 @@ class GenesisMazeScene:
             cam_y + look_dist * math.sin(heading),
             cam_z - 0.1,
         ])
-        self.camera.set_pose(pos=cam_pos, lookat=lookat)
+        self.camera.set_pose(pos=cam_pos, lookat=lookat, up=(0, 0, 1))
 
     def get_walker_position(self):
         """Get walker [x, y, z] position as numpy array."""
@@ -917,15 +926,24 @@ class BatchGenesisMazeScene:
             vis_options=gs.options.VisOptions(
                 show_world_frame=False,
                 env_separate_rigid=not _use_batch_renderer(),
+                ambient_light=(0.3, 0.3, 0.3),
+                lights=[
+                    {"type": "directional", "dir": (0, 0, -1), "color": (1.0, 1.0, 1.0), "intensity": 5.0},
+                    {"type": "directional", "dir": (-1, -1, -1), "color": (1.0, 1.0, 1.0), "intensity": 3.0},
+                ],
             ),
             renderer=renderer,
         )
 
-        # BatchRenderer requires explicit lights (Rasterizer uses default OpenGL lighting)
+        # BatchRenderer requires explicit lights (Rasterizer uses VisOptions.lights)
         if _use_batch_renderer():
             self.scene.add_light(
                 pos=(0, 0, 10), dir=(0, 0, -1),
-                directional=True, intensity=1.0, color=(1.0, 1.0, 1.0),
+                directional=True, intensity=5.0, color=(1.0, 1.0, 1.0),
+            )
+            self.scene.add_light(
+                pos=(0, 0, 10), dir=(-1, -1, -1),
+                directional=True, intensity=3.0, color=(1.0, 1.0, 1.0),
             )
 
         # --- Floor ---
@@ -1184,13 +1202,15 @@ class BatchGenesisMazeScene:
             cam_z - 0.1,
         ], axis=-1)  # (n_envs, 3)
 
+        up = np.zeros_like(cam_positions)
+        up[:, 2] = 1.0
         if self.camera is not None:
             # BatchRenderer: single vectorized call
-            self.camera.set_pose(pos=cam_positions, lookat=looktats)
+            self.camera.set_pose(pos=cam_positions, lookat=looktats, up=up)
         else:
             # Rasterizer: per-env loop
             for i in range(self.n_envs):
-                self.cameras[i].set_pose(pos=cam_positions[i], lookat=looktats[i])
+                self.cameras[i].set_pose(pos=cam_positions[i], lookat=looktats[i], up=up[i])
 
     def render_all(self):
         """Render egocentric views for all environments.
