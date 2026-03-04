@@ -77,7 +77,8 @@ WALKER_RADIUS = 0.2
 WALKER_SHELL_MASS = 1.0
 WALKER_BALLAST_MASS = 20.0
 WALKER_TOTAL_MASS = WALKER_SHELL_MASS + WALKER_BALLAST_MASS  # 21 kg
-WALKER_CAMERA_HEIGHT = 0.3
+WALKER_CAMERA_HEIGHT = 0.7   # above ball center (matching MuJoCo's 0.9m above ground)
+WALKER_CAMERA_FORWARD_OFFSET = 0.15  # forward from ball center (matching MuJoCo)
 
 # Actuator params from XML
 ROLL_GEAR = -50.0       # general actuator gear for roll joint
@@ -100,6 +101,11 @@ DEFAULT_CONTROL_TIMESTEP = 1.0 / DEFAULT_CONTROL_FREQ  # 0.25s
 # Max pre-allocated walls (one per maze wall cell; 15x15 outer grid = 17x17 = 289 cells max)
 MAX_WALLS = 225
 
+# Texture support
+N_WALL_GROUPS = 9   # '0'-'8' spatial blocks from TextMazeVaryingWalls
+WALLS_PER_GROUP = MAX_WALLS // N_WALL_GROUPS  # 25
+BOX_OBJ_PATH = os.path.join(os.path.dirname(__file__), 'assets', 'textured_box.obj')
+
 # Maze config per size (maze_size -> (n_targets, time_limit, max_rooms, room_max_size))
 MAZE_CONFIGS = {
     9:  (3, 250, 6, 5),
@@ -109,10 +115,57 @@ MAZE_CONFIGS = {
 }
 
 # ---------------------------------------------------------------------------
+# Texture loading utilities
+# ---------------------------------------------------------------------------
+
+def _load_texture_rgb(path):
+    """Load a PNG texture as an RGB numpy array (handles palette-mode PNGs)."""
+    from PIL import Image as _PILImage
+    img = _PILImage.open(path)
+    if img.mode != 'RGB':
+        img = img.convert('RGB')
+    return np.array(img)
+
+
+def _load_wall_textures():
+    """Load all style_01 wall textures as {name: rgb_array} dict."""
+    import labmaze.assets as labmaze_assets
+    paths = labmaze_assets.get_wall_texture_paths('style_01')
+    return {name: _load_texture_rgb(p) for name, p in paths.items()}
+
+
+def _load_floor_texture():
+    """Load the style_01 blue floor texture as an RGB array."""
+    import labmaze.assets as labmaze_assets
+    paths = labmaze_assets.get_floor_texture_paths('style_01')
+    return _load_texture_rgb(paths['blue'])
+
+
+def _apply_block_variations(maze):
+    """Replace '*' wall chars with '0'-'8' in a 3x3 block pattern.
+
+    Same logic as TextMazeVaryingWalls._block_variations() from maze.py.
+    """
+    nblocks = 3
+    n = maze.entity_layer.shape[0]
+    ivar = 0
+    for i in range(nblocks):
+        for j in range(nblocks):
+            i_from = i * n // nblocks
+            i_to = (i + 1) * n // nblocks
+            j_from = j * n // nblocks
+            j_to = (j + 1) * n // nblocks
+            grid = maze.entity_layer
+            rows, cols = np.where(grid[i_from:i_to, j_from:j_to] == '*')
+            grid[rows + i_from, cols + j_from] = str(ivar)
+            ivar += 1
+
+
+# ---------------------------------------------------------------------------
 # Wall segment extraction (uses dm_control.locomotion.arenas.covering)
 # ---------------------------------------------------------------------------
 
-WallSegment = namedtuple('WallSegment', ['pos', 'half_size'])
+WallSegment = namedtuple('WallSegment', ['pos', 'half_size', 'wall_char'])
 
 
 def extract_wall_segments(maze, xy_scale=2.0, z_height=1.5):
@@ -147,7 +200,7 @@ def extract_wall_segments(maze, xy_scale=2.0, z_height=1.5):
                 (wall.end.y - wall_mid_y - 0.5) * xy_scale,
                 z_height / 2.0,
             ])
-            segments.append(WallSegment(pos=pos, half_size=half_size))
+            segments.append(WallSegment(pos=pos, half_size=half_size, wall_char=wc))
 
     return segments
 
@@ -175,7 +228,7 @@ def extract_wall_cells(maze, xy_scale=2.0, z_height=1.5):
                     -(row - y_offset) * xy_scale,
                     z_height / 2.0,
                 ])
-                cells.append(WallSegment(pos=pos, half_size=half))
+                cells.append(WallSegment(pos=pos, half_size=half, wall_char=c))
     return cells
 
 
@@ -216,6 +269,8 @@ class GenesisMazeScene:
         room_min_size=3,
         room_max_size=5,
         target_height_above_ground=-0.6,
+        use_textures=True,
+        texture_seed=None,
     ):
         assert gs is not None, "Genesis is not installed. Install with: pip install genesis-world"
 
@@ -230,6 +285,7 @@ class GenesisMazeScene:
         self.room_min_size = room_min_size
         self.room_max_size = room_max_size
         self.target_height_above_ground = target_height_above_ground
+        self.use_textures = use_textures
 
         # Number of substeps per control step
         self.n_substeps = max(1, int(round(control_timestep / physics_timestep)))
@@ -267,25 +323,67 @@ class GenesisMazeScene:
             )
 
         # --- Floor ---
+        if use_textures:
+            floor_tex_array = _load_floor_texture()
+            floor_surface = gs.surfaces.Default(
+                diffuse_texture=gs.textures.ImageTexture(image_array=floor_tex_array),
+            )
+        else:
+            floor_surface = gs.surfaces.Default(color=(0.4, 0.5, 0.6, 1.0))
         self.floor = self.scene.add_entity(
             morph=gs.morphs.Plane(pos=(0, 0, 0)),
             material=gs.materials.Rigid(friction=0.5),
-            surface=gs.surfaces.Default(color=(0.4, 0.5, 0.6, 1.0)),
+            surface=floor_surface,
         )
 
-        # --- Pre-allocate wall entities (one per maze wall cell, all same size) ---
-        self.wall_entities = []
-        for i in range(MAX_WALLS):
-            wall = self.scene.add_entity(
-                morph=gs.morphs.Box(
-                    pos=(0, 0, -10),  # Start underground
-                    size=(xy_scale, xy_scale, z_height),  # Uniform per-cell size
-                    fixed=True,
-                ),
-                material=gs.materials.Rigid(friction=0.5),
-                surface=gs.surfaces.Default(color=(0.8, 0.7, 0.3, 1.0)),  # Yellow-ish walls
-            )
-            self.wall_entities.append(wall)
+        # --- Pre-allocate wall entities ---
+        if use_textures:
+            # Load all wall textures and assign one per group
+            all_wall_textures = _load_wall_textures()
+            texture_names = list(all_wall_textures.keys())
+            tex_rng = np.random.RandomState(texture_seed)
+
+            # 9 groups ('0'-'8'), each gets a random texture from the pool
+            self._wall_groups = {}  # char -> list of entities
+            for group_idx in range(N_WALL_GROUPS):
+                char = str(group_idx)
+                tex_name = tex_rng.choice(texture_names)
+                tex_array = all_wall_textures[tex_name]
+                surface = gs.surfaces.Default(
+                    diffuse_texture=gs.textures.ImageTexture(image_array=tex_array),
+                )
+                group_entities = []
+                for _ in range(WALLS_PER_GROUP):
+                    wall = self.scene.add_entity(
+                        morph=gs.morphs.Mesh(
+                            file=BOX_OBJ_PATH,
+                            pos=(0, 0, -10),
+                            scale=(xy_scale, xy_scale, z_height),
+                            fixed=True,
+                            convexify=False,
+                            decimate=False,
+                        ),
+                        material=gs.materials.Rigid(friction=0.5),
+                        surface=surface,
+                    )
+                    group_entities.append(wall)
+                self._wall_groups[char] = group_entities
+            # Flat list for backward compat (used by _configure_walls fallback)
+            self.wall_entities = [e for g in self._wall_groups.values() for e in g]
+        else:
+            self._wall_groups = None
+            self.wall_entities = []
+            for _ in range(MAX_WALLS):
+                wall = self.scene.add_entity(
+                    morph=gs.morphs.Box(
+                        pos=(0, 0, -10),
+                        size=(xy_scale, xy_scale, z_height),
+                        fixed=True,
+                    ),
+                    material=gs.materials.Rigid(friction=0.5),
+                    surface=gs.surfaces.Default(color=(0.8, 0.7, 0.3, 1.0)),
+                )
+                self.wall_entities.append(wall)
 
         # --- Walker (rolling ball) ---
         self.walker = self.scene.add_entity(
@@ -365,6 +463,8 @@ class GenesisMazeScene:
             objects_per_room=1,
             random_seed=seed,
         )
+        if self.use_textures:
+            _apply_block_variations(self._maze)
 
         # Configure walls (one entity per maze wall cell, uniform size)
         wall_segments = extract_wall_cells(self._maze, self.xy_scale, self.z_height)
@@ -408,13 +508,29 @@ class GenesisMazeScene:
 
     def _configure_walls(self, wall_segments):
         """Reposition pre-allocated wall entities for the current maze layout."""
-        for i, wall_entity in enumerate(self.wall_entities):
-            if i < len(wall_segments):
-                seg = wall_segments[i]
-                wall_entity.set_pos(seg.pos)
-            else:
-                # Move unused walls underground
-                wall_entity.set_pos(np.array([0.0, 0.0, -10.0]))
+        if self._wall_groups is not None:
+            # Textured mode: assign walls to correct texture group
+            group_usage = {char: 0 for char in self._wall_groups}
+            for seg in wall_segments:
+                char = seg.wall_char
+                if char not in self._wall_groups:
+                    continue
+                group = self._wall_groups[char]
+                idx = group_usage[char]
+                if idx < len(group):
+                    group[idx].set_pos(seg.pos)
+                    group_usage[char] += 1
+            # Hide unused walls underground
+            for char, group in self._wall_groups.items():
+                for i in range(group_usage[char], len(group)):
+                    group[i].set_pos(np.array([0.0, 0.0, -10.0]))
+        else:
+            # Flat-color mode: sequential assignment
+            for i, wall_entity in enumerate(self.wall_entities):
+                if i < len(wall_segments):
+                    wall_entity.set_pos(wall_segments[i].pos)
+                else:
+                    wall_entity.set_pos(np.array([0.0, 0.0, -10.0]))
 
     def apply_action(self, continuous_action):
         """Apply a continuous [roll, steer] action to the walker.
@@ -476,18 +592,17 @@ class GenesisMazeScene:
         walker_pos = pos.cpu().numpy() if hasattr(pos, 'cpu') else np.asarray(pos)
         heading = self._get_walker_heading()
 
-        # Camera sits on top of the ball, looking forward
-        cam_pos = np.array([
-            walker_pos[0],
-            walker_pos[1],
-            walker_pos[2] + WALKER_CAMERA_HEIGHT,
-        ])
+        # Camera above and slightly forward of ball, matching MuJoCo
+        cam_x = walker_pos[0] + WALKER_CAMERA_FORWARD_OFFSET * math.cos(heading)
+        cam_y = walker_pos[1] + WALKER_CAMERA_FORWARD_OFFSET * math.sin(heading)
+        cam_z = walker_pos[2] + WALKER_CAMERA_HEIGHT
+        cam_pos = np.array([cam_x, cam_y, cam_z])
         # Look direction: forward along heading, slightly downward
         look_dist = 1.0
         lookat = np.array([
-            walker_pos[0] + look_dist * math.cos(heading),
-            walker_pos[1] + look_dist * math.sin(heading),
-            walker_pos[2] + WALKER_CAMERA_HEIGHT - 0.1,
+            cam_x + look_dist * math.cos(heading),
+            cam_y + look_dist * math.sin(heading),
+            cam_z - 0.1,
         ])
         self.camera.set_pose(pos=cam_pos, lookat=lookat)
 
@@ -555,6 +670,7 @@ class GenesisMemoryMazeEnv(gym.Env):
         seed=None,
         good_visibility=False,
         control_freq=DEFAULT_CONTROL_FREQ,
+        use_textures=True,
         **kwargs,
     ):
         super().__init__()
@@ -611,6 +727,8 @@ class GenesisMemoryMazeEnv(gym.Env):
             max_rooms=max_rooms,
             room_max_size=room_max_size,
             target_height_above_ground=target_height,
+            use_textures=use_textures,
+            texture_seed=seed,
         )
         self._scene.build()
 
@@ -756,6 +874,8 @@ class BatchGenesisMazeScene:
         room_max_size=5,
         target_height_above_ground=-0.6,
         max_collision_pairs=200,
+        use_textures=True,
+        texture_seed=None,
     ):
         assert gs is not None, "Genesis is not installed"
         assert n_envs >= 1, "n_envs must be >= 1"
@@ -772,6 +892,7 @@ class BatchGenesisMazeScene:
         self.room_min_size = room_min_size
         self.room_max_size = room_max_size
         self.target_height_above_ground = target_height_above_ground
+        self.use_textures = use_textures
 
         self.n_substeps = max(1, int(round(control_timestep / physics_timestep)))
         self.outer_size = maze_size + 2
@@ -808,25 +929,65 @@ class BatchGenesisMazeScene:
             )
 
         # --- Floor ---
+        if use_textures:
+            floor_tex_array = _load_floor_texture()
+            floor_surface = gs.surfaces.Default(
+                diffuse_texture=gs.textures.ImageTexture(image_array=floor_tex_array),
+            )
+        else:
+            floor_surface = gs.surfaces.Default(color=(0.4, 0.5, 0.6, 1.0))
         self.floor = self.scene.add_entity(
             morph=gs.morphs.Plane(pos=(0, 0, 0)),
             material=gs.materials.Rigid(friction=0.5),
-            surface=gs.surfaces.Default(color=(0.4, 0.5, 0.6, 1.0)),
+            surface=floor_surface,
         )
 
-        # --- Pre-allocate wall pool (one per maze wall cell, uniform size) ---
-        self.wall_entities = []
-        for _ in range(MAX_WALLS):
-            wall = self.scene.add_entity(
-                morph=gs.morphs.Box(
-                    pos=(0, 0, BATCH_HIDDEN_Z),
-                    size=(xy_scale, xy_scale, z_height),  # Uniform per-cell size
-                    fixed=True,
-                ),
-                material=gs.materials.Rigid(friction=0.5),
-                surface=gs.surfaces.Default(color=(0.8, 0.7, 0.3, 1.0)),
-            )
-            self.wall_entities.append(wall)
+        # --- Pre-allocate wall pool ---
+        if use_textures:
+            all_wall_textures = _load_wall_textures()
+            texture_names = list(all_wall_textures.keys())
+            tex_rng = np.random.RandomState(texture_seed)
+
+            self._wall_groups = {}
+            for group_idx in range(N_WALL_GROUPS):
+                char = str(group_idx)
+                tex_name = tex_rng.choice(texture_names)
+                tex_array = all_wall_textures[tex_name]
+                surface = gs.surfaces.Default(
+                    diffuse_texture=gs.textures.ImageTexture(image_array=tex_array),
+                )
+                group_entities = []
+                for _ in range(WALLS_PER_GROUP):
+                    wall = self.scene.add_entity(
+                        morph=gs.morphs.Mesh(
+                            file=BOX_OBJ_PATH,
+                            pos=(0, 0, BATCH_HIDDEN_Z),
+                            scale=(xy_scale, xy_scale, z_height),
+                            fixed=True,
+                            convexify=False,
+                            decimate=False,
+                            batch_fixed_verts=True,
+                        ),
+                        material=gs.materials.Rigid(friction=0.5),
+                        surface=surface,
+                    )
+                    group_entities.append(wall)
+                self._wall_groups[char] = group_entities
+            self.wall_entities = [e for g in self._wall_groups.values() for e in g]
+        else:
+            self._wall_groups = None
+            self.wall_entities = []
+            for _ in range(MAX_WALLS):
+                wall = self.scene.add_entity(
+                    morph=gs.morphs.Box(
+                        pos=(0, 0, BATCH_HIDDEN_Z),
+                        size=(xy_scale, xy_scale, z_height),
+                        fixed=True,
+                    ),
+                    material=gs.materials.Rigid(friction=0.5),
+                    surface=gs.surfaces.Default(color=(0.8, 0.7, 0.3, 1.0)),
+                )
+                self.wall_entities.append(wall)
 
         # --- Walker ---
         self.walker = self.scene.add_entity(
@@ -905,18 +1066,37 @@ class BatchGenesisMazeScene:
         hidden at ``BATCH_HIDDEN_Z``.
         """
         idx_tensor = torch.tensor([env_idx], dtype=torch.int32)
-        for i, wall_entity in enumerate(self.wall_entities):
-            if i < len(wall_segments):
-                seg = wall_segments[i]
-                wall_entity.set_pos(
-                    np.array(seg.pos, dtype=np.float32),
-                    envs_idx=idx_tensor,
-                )
-            else:
-                wall_entity.set_pos(
-                    np.array([0.0, 0.0, BATCH_HIDDEN_Z], dtype=np.float32),
-                    envs_idx=idx_tensor,
-                )
+        hidden_pos = np.array([0.0, 0.0, BATCH_HIDDEN_Z], dtype=np.float32)
+
+        if self._wall_groups is not None:
+            # Textured mode: assign walls to correct texture group
+            group_usage = {char: 0 for char in self._wall_groups}
+            for seg in wall_segments:
+                char = seg.wall_char
+                if char not in self._wall_groups:
+                    continue
+                group = self._wall_groups[char]
+                idx = group_usage[char]
+                if idx < len(group):
+                    group[idx].set_pos(
+                        np.array(seg.pos, dtype=np.float32),
+                        envs_idx=idx_tensor,
+                    )
+                    group_usage[char] += 1
+            # Hide unused walls
+            for char, group in self._wall_groups.items():
+                for i in range(group_usage[char], len(group)):
+                    group[i].set_pos(hidden_pos, envs_idx=idx_tensor)
+        else:
+            # Flat-color mode: sequential assignment
+            for i, wall_entity in enumerate(self.wall_entities):
+                if i < len(wall_segments):
+                    wall_entity.set_pos(
+                        np.array(wall_segments[i].pos, dtype=np.float32),
+                        envs_idx=idx_tensor,
+                    )
+                else:
+                    wall_entity.set_pos(hidden_pos, envs_idx=idx_tensor)
 
     def set_walker_pose(self, env_idx, pos, heading):
         """Set walker position and heading for a single environment."""
@@ -992,17 +1172,16 @@ class BatchGenesisMazeScene:
         positions : np.ndarray, shape (n_envs, 3)
         headings : np.ndarray, shape (n_envs,)
         """
-        cam_positions = np.stack([
-            positions[:, 0],
-            positions[:, 1],
-            positions[:, 2] + WALKER_CAMERA_HEIGHT,
-        ], axis=-1)  # (n_envs, 3)
+        cam_x = positions[:, 0] + WALKER_CAMERA_FORWARD_OFFSET * np.cos(headings)
+        cam_y = positions[:, 1] + WALKER_CAMERA_FORWARD_OFFSET * np.sin(headings)
+        cam_z = positions[:, 2] + WALKER_CAMERA_HEIGHT
+        cam_positions = np.stack([cam_x, cam_y, cam_z], axis=-1)  # (n_envs, 3)
 
         look_dist = 1.0
         looktats = np.stack([
-            positions[:, 0] + look_dist * np.cos(headings),
-            positions[:, 1] + look_dist * np.sin(headings),
-            positions[:, 2] + WALKER_CAMERA_HEIGHT - 0.1,
+            cam_x + look_dist * np.cos(headings),
+            cam_y + look_dist * np.sin(headings),
+            cam_z - 0.1,
         ], axis=-1)  # (n_envs, 3)
 
         if self.camera is not None:
@@ -1090,6 +1269,7 @@ class BatchGenesisMemoryMazeEnv:
         camera_resolution=64,
         good_visibility=False,
         control_freq=DEFAULT_CONTROL_FREQ,
+        use_textures=True,
     ):
         assert gs is not None, "Genesis not installed"
 
@@ -1137,6 +1317,8 @@ class BatchGenesisMemoryMazeEnv:
             max_rooms=max_rooms,
             room_max_size=room_max_size,
             target_height_above_ground=target_height,
+            use_textures=use_textures,
+            texture_seed=seed,
         )
         self._scene.build()
 
@@ -1270,6 +1452,8 @@ class BatchGenesisMemoryMazeEnv:
             objects_per_room=1,
             random_seed=seed,
         )
+        if self._scene.use_textures:
+            _apply_block_variations(maze)
 
         # Configure walls (one entity per maze wall cell, uniform size)
         wall_segments = extract_wall_cells(maze, self._xy_scale, self._z_height)

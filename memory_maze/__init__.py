@@ -64,10 +64,19 @@ except ImportError:
     raise
 
 # Register Genesis-backed environments (separate try block — Genesis is optional).
-# Catch AttributeError too: on headless Linux without X11, pyglet raises
-# AttributeError('NoneType' ... 'XRenderFindVisualFormat') during import.
-try:
-    from .genesis_backend import register_genesis_envs
-    register_genesis_envs()
-except (ImportError, AttributeError):
-    pass  # Genesis not installed or display unavailable, skip registration
+# Uses subprocess probe: Genesis imports Taichi (quadrants) which compiles native
+# extensions requiring AVX2. On older CPUs (e.g. Sandy Bridge with only AVX),
+# this triggers SIGILL which cannot be caught by try/except.
+if os.environ.get('MEMORY_MAZE_DISABLE_GENESIS') != '1':
+    try:
+        import subprocess, sys
+        _probe = subprocess.run(
+            [sys.executable, '-c', 'import genesis'],
+            capture_output=True, timeout=30,
+        )
+        if _probe.returncode == 0:
+            from .genesis_backend import register_genesis_envs
+            register_genesis_envs()
+        del _probe
+    except (ImportError, AttributeError, subprocess.TimeoutExpired, OSError):
+        pass  # Genesis not installed, display unavailable, or import crashed

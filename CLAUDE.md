@@ -12,7 +12,8 @@ This is the Memory Maze benchmark (arxiv.org/abs/2210.13383), with both MuJoCo (
 | `wrappers.py` | dm_env observation wrappers |
 | `gym_wrappers.py` | dm_env → gym.Env adapter (`GymWrapper`) |
 | `oracle.py` | `PathToTargetWrapper` — BFS shortest-path oracle for validation |
-| `genesis_backend.py` | Genesis-based drop-in replacement (1357 lines) |
+| `genesis_backend.py` | Genesis-based drop-in replacement |
+| `assets/` | UV-mapped box OBJ for textured walls |
 | `helpers.py` | Shared utilities |
 
 ## Environment IDs
@@ -30,10 +31,12 @@ MuJoCo variants: append `-ExtraObs` for debug observations, `-HD` for 256x256, `
 
 Drop-in replacement for MuJoCo — same `gym.Env` interface, same observation/action spaces.
 
-- **Scene**: Pre-allocated 64 box walls (superset pattern), plane floor, `gs.renderers.Rasterizer()`
+- **Scene**: 225 pre-allocated wall entities (9 texture groups × 25), plane floor, `gs.renderers.Rasterizer()`
+- **Wall textures**: UV-mapped OBJ mesh (`assets/textured_box.obj`) with labmaze `style_01` PNG textures; 9 spatial blocks (`'0'`–`'8'`) each with a distinct texture, matching MuJoCo's `TextMazeVaryingWalls`. Palette-mode PNGs pre-converted to RGB. `use_textures=True` by default, `False` for flat colors.
+- **Floor texture**: Plane with labmaze `blue` floor texture (Plane has native UVs)
 - **Walker**: `gs.morphs.Sphere(radius=0.2)` with density matching MuJoCo's 21 kg, force-based control via `control_dofs_force()`
-- **Camera**: Manual `camera.set_pose()` per control step, fov=80, 64x64 resolution
-- **Targets**: Non-colliding spheres, distance-based activation (gap=1.2m), color cycling
+- **Camera**: Manual `camera.set_pose()` per control step, fov=80, 64x64, height 0.7m above ball + 0.15m forward offset (matching MuJoCo)
+- **Targets**: Non-colliding spheres, distance-based activation (gap=0.8m), color cycling
 - **BatchRenderer**: Optional Madrona-based batch renderer (`gs_madrona`) for GPU-only headless rendering
 - **macOS fix**: `GENESIS_SKIP_TK_INIT=1` and `MPLBACKEND=Agg` env vars prevent Tk/matplotlib crashes in subprocesses
 
