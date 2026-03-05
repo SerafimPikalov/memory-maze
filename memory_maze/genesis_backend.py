@@ -111,16 +111,17 @@ N_WALL_GROUPS = 9   # '0'-'8' spatial blocks from TextMazeVaryingWalls
 
 
 def _compute_walls_per_group(maze_size):
-    """Compute max walls per texture group for a given maze size.
+    """Compute wall capacity per texture group for a given maze size.
 
-    The 3x3 block division of the outer grid (maze_size+2) produces unequal
-    blocks — corner/edge blocks include exterior walls and can have more cells
-    than the average.  We use the actual worst-case block size.
+    The maze grid (outer = maze_size+2) is divided into a 3x3 block grid by
+    ``TextMazeVaryingWalls._block_variations()``.  Block spans are unequal
+    (integer division remainder), so we allocate every group to the largest
+    block area.  This keeps all groups equal-sized, which allows shuffling
+    the texture-to-region mapping each episode (matching MuJoCo behaviour).
     """
     outer = maze_size + 2
-    # Largest block span in the 3x3 grid (last block gets remainder)
-    max_span = outer - 2 * (outer // 3)  # ceiling division remainder
-    # Worst case: every cell in the largest block is a wall
+    # 3x3 block spans — last block gets the remainder
+    max_span = max((b + 1) * outer // 3 - b * outer // 3 for b in range(3))
     return max_span * max_span
 
 
@@ -377,7 +378,7 @@ class GenesisMazeScene:
             texture_names = list(all_wall_textures.keys())
             tex_rng = np.random.RandomState(texture_seed)
 
-            # 9 groups ('0'-'8'), each gets a random texture from the pool
+            # 9 equal-sized groups ('0'-'8'), each gets a random texture
             self._wall_groups = {}  # char -> list of entities
             for group_idx in range(N_WALL_GROUPS):
                 char = str(group_idx)
@@ -504,7 +505,7 @@ class GenesisMazeScene:
         if self.use_textures:
             _apply_block_variations(self._maze)
             # Shuffle texture-to-region mapping each episode (matches MuJoCo)
-            self.shuffle_wall_textures(rng)
+            self._shuffle_wall_textures(rng)
 
         # Configure walls (one entity per maze wall cell, uniform size)
         wall_segments = extract_wall_cells(self._maze, self.xy_scale, self.z_height)
@@ -546,12 +547,13 @@ class GenesisMazeScene:
         # Update camera to walker position
         self._update_camera()
 
-    def shuffle_wall_textures(self, rng):
+    def _shuffle_wall_textures(self, rng):
         """Randomly permute texture-to-region mapping each episode.
 
         MuJoCo re-randomizes wall textures every episode via rng.choice().
         Genesis pre-allocates textured entity groups at init, so we shuffle
-        which group key maps to which entity list instead.
+        which group key maps to which entity list instead.  All groups are
+        equal-sized so any permutation is safe.
         """
         if self._wall_groups is None:
             return
