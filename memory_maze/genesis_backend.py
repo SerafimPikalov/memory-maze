@@ -736,6 +736,7 @@ class GenesisMemoryMazeEnv(gym.Env):
         seed=None,
         good_visibility=False,
         control_freq=DEFAULT_CONTROL_FREQ,
+        physics_timestep=DEFAULT_PHYSICS_TIMESTEP,
         use_textures=True,
         **kwargs,
     ):
@@ -790,6 +791,7 @@ class GenesisMemoryMazeEnv(gym.Env):
             z_height=z_height,
             camera_resolution=camera_resolution,
             control_timestep=control_timestep,
+            physics_timestep=physics_timestep,
             max_rooms=max_rooms,
             room_max_size=room_max_size,
             target_height_above_ground=target_height,
