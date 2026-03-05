@@ -1363,6 +1363,7 @@ class BatchGenesisMemoryMazeEnv:
         good_visibility=False,
         control_freq=DEFAULT_CONTROL_FREQ,
         use_textures=True,
+        physics_timestep=DEFAULT_PHYSICS_TIMESTEP,
     ):
         assert gs is not None, "Genesis not installed"
 
@@ -1407,6 +1408,7 @@ class BatchGenesisMemoryMazeEnv:
             z_height=z_height,
             camera_resolution=camera_resolution,
             control_timestep=control_timestep,
+            physics_timestep=physics_timestep,
             max_rooms=max_rooms,
             room_max_size=room_max_size,
             target_height_above_ground=target_height,
