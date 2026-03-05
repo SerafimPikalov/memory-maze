@@ -27,7 +27,6 @@ from memory_maze.genesis_backend import (
     ACTION_SET,
     BATCH_HIDDEN_Z,
     CAMERA_FOV,
-    MAX_WALLS,
     ROLL_GEAR,
     STEER_GEAR,
     TARGET_ACTIVATION_GAP,
@@ -39,6 +38,7 @@ from memory_maze.genesis_backend import (
     BatchGenesisMazeScene,
     GenesisMemoryMazeEnv,
     GenesisMazeScene,
+    _max_walls,
     extract_positions,
     extract_wall_segments,
 )
@@ -370,7 +370,7 @@ class TestMaxCollisionPairsOverflow:
         assert np.all(np.isfinite(pos)), f"Non-finite position: {pos}"
 
     def test_collision_pair_count_within_limit(self, _init_genesis):
-        """The number of active walls should stay within MAX_WALLS."""
+        """The number of active walls should stay within _max_walls(maze_size)."""
         import labmaze
         for maze_size in [9, 11, 13, 15]:
             cfg = (6, 5) if maze_size < 15 else (9, 3)
@@ -382,8 +382,8 @@ class TestMaxCollisionPairsOverflow:
                 random_seed=42,
             )
             segments = extract_wall_segments(maze)
-            assert len(segments) <= MAX_WALLS, (
-                f"Maze {maze_size}x{maze_size} has {len(segments)} segments > {MAX_WALLS}"
+            assert len(segments) <= _max_walls(maze_size), (
+                f"Maze {maze_size}x{maze_size} has {len(segments)} segments > {_max_walls(maze_size)}"
             )
 
     def test_multiple_resets_no_cumulative_overflow(self, single_scene):

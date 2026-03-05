@@ -1516,16 +1516,22 @@ class BatchGenesisMemoryMazeEnv:
         dones = self._step_counts >= self._max_steps
 
         infos = [{} for _ in range(self._n_envs)]
-        for i in range(self._n_envs):
-            if dones[i]:
+        if dones.any():
+            if not dones.all():
+                raise RuntimeError(
+                    f"Batched envs desynchronized: {dones.sum()}/{self._n_envs} done. "
+                    "All envs must reset together."
+                )
+            for i in range(self._n_envs):
                 infos[i]['TimeLimit.truncated'] = True
                 infos[i]['targets_obtained'] = int(self._targets_obtained[i])
-                # Auto-reset: reset env and return new episode's first obs
                 self._reset_single_env(i)
-                # Re-render this env after reset
-                wp = self._scene.get_walker_positions()
-                self._scene.update_cameras(wp, self._walker_headings)
-                images[i] = self._scene.render_single(i)
+
+            # Batch re-render all envs once after all resets
+            wp = self._scene.get_walker_positions()
+            self._scene.update_cameras(wp, self._walker_headings)
+            images = self._scene.render_all()
+            for i in range(self._n_envs):
                 self._draw_border(images[i], self._current_target_ix[i])
 
         return images, rewards, dones, infos
