@@ -80,11 +80,19 @@ WALKER_TOTAL_MASS = WALKER_SHELL_MASS + WALKER_BALLAST_MASS  # 21 kg
 WALKER_CAMERA_HEIGHT = 0.7   # above ball center (matching MuJoCo's 0.9m above ground)
 WALKER_CAMERA_FORWARD_OFFSET = 0.15  # forward from ball center (matching MuJoCo)
 
-# Actuator params from XML
-ROLL_GEAR = -50.0       # general actuator gear for roll joint
-STEER_GEAR = 30.0       # motor gear for steer joint
-ROLL_DAMPING = 5.0      # from RollingBallWithFriction
-STEER_DAMPING = 20.0    # from RollingBallWithFriction
+# Actuator params — tuned to match MuJoCo's effective dynamics.
+# MuJoCo uses torque on a rolling hinge (friction-coupled to ground);
+# Genesis uses direct translational force on a free sphere.
+# To compensate, we use low surface friction + translational DOF damping.
+# Terminal velocity: v_ss = |ROLL_GEAR| / TRANS_DAMPING = 400/200 = 2.0 m/s (matches MuJoCo)
+# Terminal steer rate: STEER_GEAR / STEER_DAMPING ≈ 1.28 rad/s (matches MuJoCo)
+ROLL_GEAR = -400.0      # translational force magnitude (gear * roll_cmd)
+STEER_GEAR = 30.0       # steer torque magnitude (gear * steer_cmd)
+TRANS_DAMPING = 200.0   # translational damping on tx, ty (provides deceleration)
+ROLL_DAMPING = 5.0      # rotational damping on rx, ry
+STEER_DAMPING = 23.4    # rotational damping on rz (30/23.4 ≈ 1.28 rad/s)
+WALKER_FRICTION = 0.01   # minimum allowed by Genesis; uses max(mu_a, mu_b) for contact pairs
+FLOOR_FRICTION = 0.01    # minimum allowed; effective walker-floor friction = 0.01
 
 # MuJoCo camera
 CAMERA_FOV = 80  # fovy from XML
@@ -356,7 +364,7 @@ class GenesisMazeScene:
             floor_surface = gs.surfaces.Default(color=(0.4, 0.5, 0.6, 1.0))
         self.floor = self.scene.add_entity(
             morph=gs.morphs.Plane(pos=(0, 0, 0)),
-            material=gs.materials.Rigid(friction=0.5),
+            material=gs.materials.Rigid(friction=FLOOR_FRICTION),
             surface=floor_surface,
         )
 
@@ -419,7 +427,7 @@ class GenesisMazeScene:
                 fixed=False,
             ),
             material=gs.materials.Rigid(
-                friction=0.5,
+                friction=WALKER_FRICTION,
                 rho=WALKER_TOTAL_MASS / ((4.0 / 3.0) * math.pi * WALKER_RADIUS**3),
             ),
             surface=gs.surfaces.Default(color=(0.757, 0.757, 0.757, 1.0)),
@@ -466,11 +474,13 @@ class GenesisMazeScene:
 
         # Configure walker DOF damping after build
         # DOFs: [tx, ty, tz, rx, ry, rz]
-        # Translational damping emulates roll friction (ROLL_DAMPING=5.0)
-        # Rotational z-damping emulates steer friction (STEER_DAMPING=20.0)
+        # MuJoCo's rolling ball uses hinge torque + ground friction for locomotion.
+        # Genesis uses direct translational force, so we add translational damping
+        # to replace the role of rolling/sliding friction in deceleration.
+        # v_ss = |ROLL_GEAR| / TRANS_DAMPING = 400/200 = 2.0 m/s (matches MuJoCo)
         self.walker.set_dofs_damping(np.array([
-            ROLL_DAMPING, ROLL_DAMPING, 0.0,  # x, y, z translation
-            0.0, 0.0, STEER_DAMPING,          # rx, ry, rz rotation
+            TRANS_DAMPING, TRANS_DAMPING, 0.0,         # tx, ty, tz
+            ROLL_DAMPING, ROLL_DAMPING, STEER_DAMPING, # rx, ry, rz
         ]))
 
     def reset(self, rng):
@@ -619,16 +629,26 @@ class GenesisMazeScene:
         """Step physics for one control timestep (multiple substeps)."""
         for _ in range(self.n_substeps):
             self.scene.step(update_visualizer=False)
+        # Update heading from z-axis angular velocity (DOF index 5 = rz).
+        # This avoids quaternion yaw extraction which is unreliable for a
+        # rolling sphere (roll/pitch rotations corrupt the yaw component).
+        # Negated because MuJoCo's steer joint axis is (0,0,-1) while
+        # Genesis rz DOF uses (0,0,+1), so omega_z has opposite sign.
+        vel = self.walker.get_dofs_velocity()
+        v = vel.cpu().numpy() if hasattr(vel, 'cpu') else np.asarray(vel)
+        omega_z = float(v[5])
+        self._walker_heading -= omega_z * self.control_timestep
         self._update_camera()
 
     def _get_walker_heading(self):
-        """Get walker heading angle from its quaternion."""
-        quat = self.walker.get_quat()
-        q = quat.cpu().numpy() if hasattr(quat, 'cpu') else np.asarray(quat)
-        # Extract yaw from quaternion (w, x, y, z)
-        heading = math.atan2(2 * (q[0] * q[3] + q[1] * q[2]),
-                             1 - 2 * (q[2]**2 + q[3]**2))
-        return heading
+        """Get walker heading from tracked state.
+
+        We track heading via z-axis angular velocity integration rather than
+        extracting yaw from the sphere's quaternion.  A rolling ball accumulates
+        rotation around its roll/pitch axes as it moves, so quaternion-based yaw
+        is unreliable and can flip 180° after enough forward rolling.
+        """
+        return self._walker_heading
 
     def _update_camera(self):
         """Update camera position/orientation to follow walker."""
@@ -991,7 +1011,7 @@ class BatchGenesisMazeScene:
             floor_surface = gs.surfaces.Default(color=(0.4, 0.5, 0.6, 1.0))
         self.floor = self.scene.add_entity(
             morph=gs.morphs.Plane(pos=(0, 0, 0)),
-            material=gs.materials.Rigid(friction=0.5),
+            material=gs.materials.Rigid(friction=FLOOR_FRICTION),
             surface=floor_surface,
         )
 
@@ -1108,9 +1128,10 @@ class BatchGenesisMazeScene:
         self._built = True
 
         # Configure walker damping (broadcasts to all envs)
+        # Rotational damping on rx,ry (roll) and rz (steer), matching MuJoCo.
         damping = np.array([
-            ROLL_DAMPING, ROLL_DAMPING, 0.0,
-            0.0, 0.0, STEER_DAMPING,
+            0.0, 0.0, 0.0,
+            ROLL_DAMPING, ROLL_DAMPING, STEER_DAMPING,
         ])
         self.walker.set_dofs_damping(damping)
 
@@ -1460,12 +1481,13 @@ class BatchGenesisMemoryMazeEnv:
         self._scene.apply_actions_batched(forces.astype(np.float32))
         self._scene.step()
 
-        # 4. Extract headings from quaternions (vectorized)
-        quats = self._scene.get_walker_quats()  # (n_envs, 4)
-        self._walker_headings = np.arctan2(
-            2 * (quats[:, 0] * quats[:, 3] + quats[:, 1] * quats[:, 2]),
-            1 - 2 * (quats[:, 2] ** 2 + quats[:, 3] ** 2),
-        )
+        # 4. Update headings from z-axis angular velocity (avoids quaternion
+        #    yaw extraction which is unreliable for rolling spheres).
+        #    Negated: MuJoCo steer axis is (0,0,-1), Genesis rz is (0,0,+1).
+        vel = self._scene.walker.get_dofs_velocity()  # (n_envs, 6)
+        vel_np = vel.cpu().numpy() if hasattr(vel, 'cpu') else np.asarray(vel)
+        omega_z = vel_np[:, 5]  # rz angular velocity per env
+        self._walker_headings -= omega_z * self._scene.control_timestep
 
         # 5. Check target contacts (vectorized distance computation)
         positions = self._scene.get_walker_positions()  # (n_envs, 3)
