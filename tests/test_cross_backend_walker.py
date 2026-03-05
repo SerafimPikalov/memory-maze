@@ -16,8 +16,7 @@ Run with:
 import math
 import os
 
-# Must set MUJOCO_GL before dm_control is imported (macOS has no EGL)
-os.environ.setdefault("MUJOCO_GL", "glfw")
+# Rendering backend env vars are set in conftest.py (must happen before PyOpenGL imports)
 
 import numpy as np
 import pytest
@@ -58,10 +57,11 @@ class WalkerTestHarness:
     true cumulative heading change.
     """
 
-    def __init__(self, backend: str, seed: int = 42):
+    def __init__(self, backend: str, seed: int = 42, physics_timestep: float = None):
         self.backend = backend
         self.seed = seed
         self._rng = np.random.RandomState(seed)
+        self._physics_timestep = physics_timestep
 
         if backend == "mujoco":
             self._init_mujoco()
@@ -90,11 +90,10 @@ class WalkerTestHarness:
 
     def _init_genesis(self):
         """Build Genesis scene directly."""
-        self._scene = GenesisMazeScene(
-            maze_size=9,
-            n_targets=3,
-            use_textures=False,  # faster for tests
-        )
+        kwargs = dict(maze_size=9, n_targets=3, use_textures=False)
+        if self._physics_timestep is not None:
+            kwargs["physics_timestep"] = self._physics_timestep
+        self._scene = GenesisMazeScene(**kwargs)
         self._scene.build()
 
     def reset(self) -> dict:
@@ -188,7 +187,8 @@ def heading_vec(heading):
 @pytest.fixture(params=["mujoco", "genesis"])
 def harness(request, init_genesis_if_needed):
     """Parametrized fixture: runs each test on both backends."""
-    h = WalkerTestHarness(backend=request.param, seed=42)
+    ts = request.config.getoption("--physics-timestep")
+    h = WalkerTestHarness(backend=request.param, seed=42, physics_timestep=ts)
     h.reset()
     yield h
     h.close()
@@ -204,9 +204,10 @@ def mujoco_harness():
 
 
 @pytest.fixture
-def genesis_harness(init_genesis_if_needed):
+def genesis_harness(request, init_genesis_if_needed):
     """Genesis-only harness."""
-    h = WalkerTestHarness(backend="genesis", seed=42)
+    ts = request.config.getoption("--physics-timestep")
+    h = WalkerTestHarness(backend="genesis", seed=42, physics_timestep=ts)
     h.reset()
     yield h
     h.close()
@@ -535,16 +536,17 @@ class TestActionSequences:
 class TestCrossBackend:
     """Run BOTH backends and compare behavioral properties directly."""
 
-    def _make_pair(self, init_genesis_if_needed):
+    def _make_pair(self, init_genesis_if_needed, request=None):
+        ts = request.config.getoption("--physics-timestep") if request else None
         mj = WalkerTestHarness(backend="mujoco", seed=42)
         mj.reset()
-        ge = WalkerTestHarness(backend="genesis", seed=42)
+        ge = WalkerTestHarness(backend="genesis", seed=42, physics_timestep=ts)
         ge.reset()
         return mj, ge
 
-    def test_forward_direction_matches(self, init_genesis_if_needed):
+    def test_forward_direction_matches(self, init_genesis_if_needed, request):
         """Both backends move forward along their heading direction."""
-        mj, ge = self._make_pair(init_genesis_if_needed)
+        mj, ge = self._make_pair(init_genesis_if_needed, request)
         try:
             s0_mj = mj.get_state()
             run_actions(mj, action=1, n_steps=20)
@@ -575,9 +577,9 @@ class TestCrossBackend:
             mj.close()
             ge.close()
 
-    def test_turn_direction_matches(self, init_genesis_if_needed):
+    def test_turn_direction_matches(self, init_genesis_if_needed, request):
         """Both backends turn left in the same rotational direction (CCW)."""
-        mj, ge = self._make_pair(init_genesis_if_needed)
+        mj, ge = self._make_pair(init_genesis_if_needed, request)
         try:
             s0_mj = mj.get_state()
             run_actions(mj, action=2, n_steps=20)
@@ -595,9 +597,9 @@ class TestCrossBackend:
             mj.close()
             ge.close()
 
-    def test_deceleration_both_stop(self, init_genesis_if_needed):
+    def test_deceleration_both_stop(self, init_genesis_if_needed, request):
         """Both backends decelerate to near-zero velocity after coast."""
-        mj, ge = self._make_pair(init_genesis_if_needed)
+        mj, ge = self._make_pair(init_genesis_if_needed, request)
         try:
             run_actions(mj, action=1, n_steps=20)
             run_actions(mj, action=0, n_steps=40)
@@ -768,9 +770,13 @@ class TestOracleNavigation:
         env.close()
 
     @pytest.mark.skipif(not HAS_GENESIS, reason="Genesis not installed")
-    def test_genesis_oracle_reaches_target(self, init_genesis_if_needed):
+    def test_genesis_oracle_reaches_target(self, init_genesis_if_needed, request):
         """Genesis: BFS path to target, reactive navigate, collect reward."""
-        genesis_env = GenesisMemoryMazeEnv(maze_size=9, seed=42, use_textures=False)
+        ts = request.config.getoption("--physics-timestep")
+        kwargs = dict(maze_size=9, seed=42, use_textures=False)
+        if ts is not None:
+            kwargs["physics_timestep"] = ts
+        genesis_env = GenesisMemoryMazeEnv(**kwargs)
         genesis_env.reset()
 
         scene = genesis_env._scene

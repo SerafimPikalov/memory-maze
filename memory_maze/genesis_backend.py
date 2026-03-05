@@ -5,8 +5,10 @@ Replaces the MuJoCo/dm_control stack with Genesis for GPU-accelerated
 physics and rendering. Implements the same gym.Env interface.
 """
 
+import logging
 import math
 import os
+import time as _time
 from collections import namedtuple
 
 # Prevent matplotlib (imported by Genesis) from initializing Tk, which
@@ -965,11 +967,18 @@ class BatchGenesisMazeScene:
         self.n_substeps = max(1, int(round(control_timestep / physics_timestep)))
         self.outer_size = maze_size + 2
 
+        _log = logging.getLogger("genesis_backend")
+        _t0 = _time.monotonic()
+        def _elapsed():
+            return f"{_time.monotonic() - _t0:.1f}s"
+
         # --- Create scene ---
         if _use_batch_renderer():
             renderer = gs.renderers.BatchRenderer(use_rasterizer=True)
         else:
             renderer = gs.renderers.Rasterizer()
+        _log.info("[%s] Creating scene (renderer=%s, batch_renderer=%s)",
+                  _elapsed(), type(renderer).__name__, _use_batch_renderer())
 
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(
@@ -1018,10 +1027,13 @@ class BatchGenesisMazeScene:
             material=gs.materials.Rigid(friction=FLOOR_FRICTION),
             surface=floor_surface,
         )
+        _log.info("[%s] Floor entity added", _elapsed())
 
         # --- Pre-allocate wall pool ---
         walls_per_group = _compute_walls_per_group(maze_size)
         max_walls = walls_per_group * N_WALL_GROUPS
+        _log.info("[%s] Adding %d wall entities (%d groups x %d, textures=%s)",
+                  _elapsed(), max_walls, N_WALL_GROUPS, walls_per_group, use_textures)
         if use_textures:
             all_wall_textures = _load_wall_textures()
             texture_names = list(all_wall_textures.keys())
@@ -1068,6 +1080,8 @@ class BatchGenesisMazeScene:
                 )
                 self.wall_entities.append(wall)
 
+        _log.info("[%s] All %d wall entities added", _elapsed(), len(self.wall_entities))
+
         # --- Walker ---
         self.walker = self.scene.add_entity(
             morph=gs.morphs.Sphere(
@@ -1081,6 +1095,8 @@ class BatchGenesisMazeScene:
             ),
             surface=gs.surfaces.Default(color=(0.757, 0.757, 0.757, 1.0)),
         )
+
+        _log.info("[%s] Walker entity added", _elapsed())
 
         # --- Targets (non-colliding) ---
         self.target_entities = []
@@ -1099,6 +1115,8 @@ class BatchGenesisMazeScene:
                 ),
             )
             self.target_entities.append(target)
+
+        _log.info("[%s] %d target entities added", _elapsed(), n_targets)
 
         # --- Cameras ---
         if _use_batch_renderer():
@@ -1125,10 +1143,15 @@ class BatchGenesisMazeScene:
                 self.cameras.append(cam)
 
         self._built = False
+        _log.info("[%s] Cameras added. Scene __init__ complete, ready to build.", _elapsed())
 
     def build(self):
         """Build the scene with n_envs parallel environments."""
+        _log = logging.getLogger("genesis_backend")
+        _t0 = _time.monotonic()
+        _log.info("[0.0s] scene.build(n_envs=%d) starting...", self.n_envs)
         self.scene.build(n_envs=self.n_envs)
+        _log.info("[%.1fs] scene.build() complete", _time.monotonic() - _t0)
         self._built = True
 
         # Configure walker damping (broadcasts to all envs)
@@ -1138,6 +1161,7 @@ class BatchGenesisMazeScene:
             ROLL_DAMPING, ROLL_DAMPING, STEER_DAMPING,
         ])
         self.walker.set_dofs_damping(damping)
+        _log.info("[%.1fs] Walker damping configured. Build done.", _time.monotonic() - _t0)
 
     def shuffled_wall_groups(self, rng):
         """Return a shuffled copy of wall_groups (does not mutate shared state)."""
@@ -1398,12 +1422,18 @@ class BatchGenesisMemoryMazeEnv:
             np.random.RandomState(base_seed + i) for i in range(n_envs)
         ]
 
+        _log = logging.getLogger("genesis_backend")
+
         # Initialize Genesis if needed
         if not gs._initialized:
             backend = gs.cuda if _BATCH_RENDERER_AVAILABLE else gs.cpu
+            _log.info("gs.init(backend=%s) ...", backend)
             gs.init(backend=backend, logging_level='warning')
+            _log.info("gs.init done, device=%s", gs.device)
 
         # Build batched scene
+        _log.info("Creating BatchGenesisMazeScene(n_envs=%d, maze=%d, textures=%s) ...",
+                  n_envs, maze_size, use_textures)
         self._scene = BatchGenesisMazeScene(
             n_envs=n_envs,
             maze_size=maze_size,
@@ -1419,7 +1449,9 @@ class BatchGenesisMemoryMazeEnv:
             use_textures=use_textures,
             texture_seed=seed,
         )
+        _log.info("Scene __init__ done, calling build() ...")
         self._scene.build()
+        _log.info("Scene build complete!")
 
         # Per-env persistent maze objects (created on first reset, then regenerated)
         self._mazes = [None] * n_envs

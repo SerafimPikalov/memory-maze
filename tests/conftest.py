@@ -1,7 +1,22 @@
 """Shared fixtures for Memory Maze Genesis backend tests."""
 
+import os
+import sys
+
+# Must set rendering backend before any PyOpenGL/dm_control imports
+if sys.platform == "darwin":
+    os.environ.setdefault("MUJOCO_GL", "glfw")
+else:
+    os.environ.setdefault("MUJOCO_GL", "egl")
+    os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+
 import numpy as np
 import pytest
+
+
+def pytest_addoption(parser):
+    parser.addoption("--physics-timestep", type=float, default=None,
+                     help="Override Genesis physics timestep (default: 0.005)")
 
 # Skip entire test module if Genesis is not installed
 try:
