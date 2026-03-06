@@ -1114,7 +1114,7 @@ class BatchGenesisMazeScene:
                 visualization=False,
             ),
             material=gs.materials.Rigid(
-                friction=0.5,
+                friction=WALKER_FRICTION,
                 rho=WALKER_TOTAL_MASS / ((4.0 / 3.0) * math.pi * WALKER_RADIUS ** 3),
             ),
             surface=gs.surfaces.Default(color=(0.757, 0.757, 0.757, 1.0)),
@@ -1179,9 +1179,11 @@ class BatchGenesisMazeScene:
         self._built = True
 
         # Configure walker damping (broadcasts to all envs)
-        # Rotational damping on rx,ry (roll) and rz (steer), matching MuJoCo.
+        # DOFs: [tx, ty, tz, rx, ry, rz]
+        # Translational damping on tx,ty replaces rolling friction for deceleration.
+        # v_ss = |ROLL_GEAR| / TRANS_DAMPING = 400/200 = 2.0 m/s (matches MuJoCo)
         damping = np.array([
-            0.0, 0.0, 0.0,
+            TRANS_DAMPING, TRANS_DAMPING, 0.0,
             ROLL_DAMPING, ROLL_DAMPING, STEER_DAMPING,
         ])
         self.walker.set_dofs_damping(damping)

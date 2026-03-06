@@ -27,12 +27,16 @@ from memory_maze.genesis_backend import (
     ACTION_SET,
     BATCH_HIDDEN_Z,
     CAMERA_FOV,
+    ROLL_DAMPING,
     ROLL_GEAR,
+    STEER_DAMPING,
     STEER_GEAR,
     TARGET_ACTIVATION_GAP,
     TARGET_COLORS,
     TARGET_RADIUS,
+    TRANS_DAMPING,
     WALKER_CAMERA_HEIGHT,
+    WALKER_FRICTION,
     WALKER_RADIUS,
     BatchGenesisMemoryMazeEnv,
     BatchGenesisMazeScene,
@@ -816,3 +820,33 @@ class TestTrainingSmokeTest:
             assert np.all(np.isfinite(obs.astype(np.float32)))
             assert np.all(np.isfinite(rewards))
         env.close()
+
+
+# ---------------------------------------------------------------------------
+# Batched vs non-batched physics parity (no GPU needed — source inspection)
+# ---------------------------------------------------------------------------
+
+class TestBatchedPhysicsParity:
+    """Verify batched scene uses the same physics constants as non-batched.
+
+    Catches copy-paste bugs like hardcoded friction/damping values that
+    diverge from the tuned constants (e.g. friction=0.5 vs WALKER_FRICTION=0.01).
+    """
+
+    def test_walker_friction_uses_constant(self):
+        """Batched walker friction must match WALKER_FRICTION, not a hardcoded value."""
+        import inspect
+        source = inspect.getsource(BatchGenesisMazeScene.__init__)
+        assert 'friction=0.5,\n                rho=WALKER_TOTAL_MASS' not in source, \
+            "Batched walker uses hardcoded friction=0.5 instead of WALKER_FRICTION"
+        assert 'friction=WALKER_FRICTION' in source, \
+            "Batched walker friction should use WALKER_FRICTION constant"
+
+    def test_walker_damping_has_trans_damping(self):
+        """Batched walker damping must include TRANS_DAMPING on tx, ty DOFs."""
+        import inspect
+        source = inspect.getsource(BatchGenesisMazeScene.build)
+        assert 'TRANS_DAMPING, TRANS_DAMPING, 0.0' in source, \
+            "Batched walker damping missing TRANS_DAMPING on tx, ty DOFs"
+        assert '0.0, 0.0, 0.0,\n            ROLL_DAMPING' not in source, \
+            "Batched walker damping has 0.0 for tx, ty instead of TRANS_DAMPING"
