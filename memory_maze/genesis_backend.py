@@ -80,7 +80,7 @@ WALKER_SHELL_MASS = 1.0
 WALKER_BALLAST_MASS = 20.0
 WALKER_TOTAL_MASS = WALKER_SHELL_MASS + WALKER_BALLAST_MASS  # 21 kg
 WALKER_CAMERA_HEIGHT = 0.7   # above ball center (matching MuJoCo's 0.9m above ground)
-WALKER_CAMERA_FORWARD_OFFSET = 0.15  # forward from ball center (matching MuJoCo)
+WALKER_CAMERA_FORWARD_OFFSET = 0.0  # at ball center — 0.2m clearance to walls (prevents see-through in raycast)
 
 # Actuator params — tuned to match MuJoCo's effective dynamics.
 # MuJoCo uses torque on a rolling hinge (friction-coupled to ground);
@@ -110,6 +110,41 @@ DEFAULT_CONTROL_TIMESTEP = 1.0 / DEFAULT_CONTROL_FREQ  # 0.25s
 
 # Texture support
 N_WALL_GROUPS = 9   # '0'-'8' spatial blocks from TextMazeVaryingWalls
+
+# ---------------------------------------------------------------------------
+# Lighting — cardinal directional lights for direction-independent walls.
+#
+# BatchRenderer (Madrona) has ambient hardcoded in shaders (raised to 0.3
+# in our C++ fix; was 0.05).  We add 6 directional lights from axis directions
+# so every wall face is lit regardless of heading.  The C++ clamp fix prevents
+# uint8 overflow, so any intensity is safe.
+#
+# Rasterizer (pyrender) has MAX_N_LIGHTS=4, so it only gets the 4 horizontal
+# lights.  Vertical lighting is handled by its ambient_light (set to 0.5).
+# ---------------------------------------------------------------------------
+_LIGHT_INTENSITY = 1.5
+_LIGHT_DIRS_HORIZ = [
+    (1, 0, 0), (-1, 0, 0),   # +X, -X  (N/S walls)
+    (0, 1, 0), (0, -1, 0),   # +Y, -Y  (E/W walls)
+]
+_LIGHT_DIRS_VERT = [
+    (0, 0, -1), (0, 0, 1),   # -Z, +Z  (floor / ceiling)
+]
+_LIGHT_DIRS_ALL = _LIGHT_DIRS_HORIZ + _LIGHT_DIRS_VERT
+# VisOptions.lights format (for Rasterizer — max 4 directional lights)
+_CARDINAL_LIGHTS_VIS = [
+    {"type": "directional", "dir": d, "color": (1.0, 1.0, 1.0), "intensity": _LIGHT_INTENSITY}
+    for d in _LIGHT_DIRS_HORIZ
+]
+# scene.add_light() kwargs (for BatchRenderer — no light limit)
+# castshadow=False prevents shadow acne (dark speckle noise on walls at close range).
+# The maze has uniform ambient + directional lighting — shadows add noise, not value.
+_CARDINAL_LIGHTS_BATCH = [
+    {"pos": (0, 0, 10), "dir": d, "directional": True,
+     "intensity": _LIGHT_INTENSITY, "color": (1.0, 1.0, 1.0),
+     "castshadow": False}
+    for d in _LIGHT_DIRS_ALL
+]
 
 
 def _compute_walls_per_group(maze_size):
@@ -337,25 +372,16 @@ class GenesisMazeScene:
             ),
             vis_options=gs.options.VisOptions(
                 show_world_frame=False,
-                ambient_light=(0.3, 0.3, 0.3),
-                lights=[
-                    {"type": "directional", "dir": (0, 0, -1), "color": (1.0, 1.0, 1.0), "intensity": 5.0},
-                    {"type": "directional", "dir": (-1, -1, -1), "color": (1.0, 1.0, 1.0), "intensity": 3.0},
-                ],
+                ambient_light=(0.5, 0.5, 0.5),
+                lights=_CARDINAL_LIGHTS_VIS,
             ),
             renderer=renderer,
         )
 
         # BatchRenderer requires explicit lights (Rasterizer uses VisOptions.lights)
         if _use_batch_renderer():
-            self.scene.add_light(
-                pos=(0, 0, 10), dir=(0, 0, -1),
-                directional=True, intensity=5.0, color=(1.0, 1.0, 1.0),
-            )
-            self.scene.add_light(
-                pos=(0, 0, 10), dir=(-1, -1, -1),
-                directional=True, intensity=3.0, color=(1.0, 1.0, 1.0),
-            )
+            for ldef in _CARDINAL_LIGHTS_BATCH:
+                self.scene.add_light(**ldef)
 
         # --- Floor ---
         if use_textures:
@@ -423,11 +449,15 @@ class GenesisMazeScene:
                 self.wall_entities.append(wall)
 
         # --- Walker (rolling ball) ---
+        # visualization=False: egocentric camera sits at ball center (offset=0.0),
+        # so the sphere must be invisible to avoid raycast self-intersection.
+        # Physics/collision still work — only visual geometry is skipped.
         self.walker = self.scene.add_entity(
             morph=gs.morphs.Sphere(
                 pos=(0, 0, WALKER_RADIUS),
                 radius=WALKER_RADIUS,
                 fixed=False,
+                visualization=False,
             ),
             material=gs.materials.Rigid(
                 friction=WALKER_FRICTION,
@@ -994,25 +1024,16 @@ class BatchGenesisMazeScene:
             vis_options=gs.options.VisOptions(
                 show_world_frame=False,
                 env_separate_rigid=not _use_batch_renderer(),
-                ambient_light=(0.3, 0.3, 0.3),
-                lights=[
-                    {"type": "directional", "dir": (0, 0, -1), "color": (1.0, 1.0, 1.0), "intensity": 5.0},
-                    {"type": "directional", "dir": (-1, -1, -1), "color": (1.0, 1.0, 1.0), "intensity": 3.0},
-                ],
+                ambient_light=(0.5, 0.5, 0.5),
+                lights=_CARDINAL_LIGHTS_VIS,
             ),
             renderer=renderer,
         )
 
         # BatchRenderer requires explicit lights (Rasterizer uses VisOptions.lights)
         if _use_batch_renderer():
-            self.scene.add_light(
-                pos=(0, 0, 10), dir=(0, 0, -1),
-                directional=True, intensity=5.0, color=(1.0, 1.0, 1.0),
-            )
-            self.scene.add_light(
-                pos=(0, 0, 10), dir=(-1, -1, -1),
-                directional=True, intensity=3.0, color=(1.0, 1.0, 1.0),
-            )
+            for ldef in _CARDINAL_LIGHTS_BATCH:
+                self.scene.add_light(**ldef)
 
         # --- Floor ---
         if use_textures:
@@ -1083,11 +1104,14 @@ class BatchGenesisMazeScene:
         _log.info("[%s] All %d wall entities added", _elapsed(), len(self.wall_entities))
 
         # --- Walker ---
+        # visualization=False: egocentric camera at ball center needs sphere hidden
+        # from raycast to prevent self-intersection. Physics/collision unaffected.
         self.walker = self.scene.add_entity(
             morph=gs.morphs.Sphere(
                 pos=(0, 0, WALKER_RADIUS),
                 radius=WALKER_RADIUS,
                 fixed=False,
+                visualization=False,
             ),
             material=gs.materials.Rigid(
                 friction=0.5,

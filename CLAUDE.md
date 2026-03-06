@@ -37,7 +37,7 @@ Drop-in replacement for MuJoCo — same `gym.Env` interface, same observation/ac
 - **Walker**: `gs.morphs.Sphere(radius=0.2)` with density matching MuJoCo's 21 kg. Uses direct translational force + viscous damping (not rolling contact like MuJoCo). Key params: `ROLL_GEAR=-400`, `TRANS_DAMPING=200` → v_ss=2.0 m/s; `STEER_DAMPING=23.4` → omega_ss=1.28 rad/s; `WALKER_FRICTION=FLOOR_FRICTION=0.01` (minimum, to avoid Coulomb friction blocking translational force)
 - **Camera**: Manual `camera.set_pose()` per control step, fov=80, 64x64, height 0.7m above ball + 0.15m forward offset (matching MuJoCo)
 - **Targets**: Non-colliding spheres, distance-based activation (gap=0.8m), color cycling
-- **BatchRenderer**: Optional Madrona-based batch renderer (`gs_madrona`) for GPU-only headless rendering
+- **BatchRenderer**: Optional Madrona-based batch renderer (`gs_madrona`) for GPU-only headless rendering. Uses 6 cardinal directional lights (`castshadow=False`, intensity=1.5) for direction-independent illumination. Requires `gs_madrona` built from source with uint8 clamp fix (see `Dockerfile.runpod`).
 - **macOS fix**: `GENESIS_SKIP_TK_INIT=1` and `MPLBACKEND=Agg` env vars prevent Tk/matplotlib crashes in subprocesses
 
 ## Build & Test
