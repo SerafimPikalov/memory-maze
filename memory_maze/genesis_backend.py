@@ -102,6 +102,9 @@ CAMERA_FOV = 80  # fovy from XML
 # Target detection
 TARGET_RADIUS = 0.6
 TARGET_ACTIVATION_GAP = WALKER_RADIUS + TARGET_RADIUS  # 0.8m center-to-center, matches MuJoCo contact detection
+# Spheres receive light from all directions (curved surface catches ~3 of 6 cardinal lights),
+# so they appear brighter than flat walls. Scale down to compensate.
+TARGET_COLOR_SCALE = 0.5
 
 # Timing
 DEFAULT_CONTROL_FREQ = 4.0
@@ -479,7 +482,7 @@ class GenesisMazeScene:
                     collision=False,  # Targets don't block movement
                 ),
                 surface=gs.surfaces.Default(
-                    color=(float(color[0]), float(color[1]), float(color[2]), 1.0),
+                    color=(float(color[0] * TARGET_COLOR_SCALE), float(color[1] * TARGET_COLOR_SCALE), float(color[2] * TARGET_COLOR_SCALE), 1.0),
                 ),
             )
             self.target_entities.append(target)
@@ -1135,7 +1138,7 @@ class BatchGenesisMazeScene:
                     collision=False,
                 ),
                 surface=gs.surfaces.Default(
-                    color=(float(color[0]), float(color[1]), float(color[2]), 1.0),
+                    color=(float(color[0] * TARGET_COLOR_SCALE), float(color[1] * TARGET_COLOR_SCALE), float(color[2] * TARGET_COLOR_SCALE), 1.0),
                 ),
             )
             self.target_entities.append(target)
