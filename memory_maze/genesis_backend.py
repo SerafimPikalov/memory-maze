@@ -711,7 +711,7 @@ class GenesisMazeScene:
 
     def render_egocentric(self):
         """Render egocentric camera view. Returns uint8 numpy [H, W, 3]."""
-        result = self.camera.render(rgb=True, depth=False, segmentation=False)
+        result = self.camera.render(rgb=True, depth=False, segmentation=False, force_render=True)
         # render() returns a tuple: (rgb, depth, segmentation, normal)
         rgb = result[0]
         if hasattr(rgb, 'cpu'):
@@ -1348,14 +1348,14 @@ class BatchGenesisMazeScene:
         """
         if self.camera is not None:
             # BatchRenderer: one call returns (n_envs, H, W, 3) CUDA tensor
-            rgb = self.camera.render(rgb=True, depth=False, segmentation=False)[0]
+            rgb = self.camera.render(rgb=True, depth=False, segmentation=False, force_render=True)[0]
             return rgb.cpu().numpy().astype(np.uint8)
         else:
             # Rasterizer: sequential per-env loop
             res = self.camera_resolution
             images = np.empty((self.n_envs, res, res, 3), dtype=np.uint8)
             for i in range(self.n_envs):
-                result = self.cameras[i].render(rgb=True, depth=False, segmentation=False)
+                result = self.cameras[i].render(rgb=True, depth=False, segmentation=False, force_render=True)
                 rgb = result[0]
                 if hasattr(rgb, 'cpu'):
                     rgb = rgb.cpu().numpy()
@@ -1371,11 +1371,11 @@ class BatchGenesisMazeScene:
         """
         if self.camera is not None:
             # BatchRenderer: render all, extract one
-            rgb = self.camera.render(rgb=True, depth=False, segmentation=False)[0]
+            rgb = self.camera.render(rgb=True, depth=False, segmentation=False, force_render=True)[0]
             return rgb[env_idx].cpu().numpy().astype(np.uint8)
         else:
             # Rasterizer: render specific camera
-            result = self.cameras[env_idx].render(rgb=True, depth=False, segmentation=False)
+            result = self.cameras[env_idx].render(rgb=True, depth=False, segmentation=False, force_render=True)
             rgb = result[0]
             if hasattr(rgb, 'cpu'):
                 rgb = rgb.cpu().numpy()
