@@ -6,6 +6,7 @@ Run with: pytest tests/test_genesis_batch.py -v -m "not slow"
 
 import math
 import os
+import sys
 import time
 
 # Must set MUJOCO_GL before dm_control is imported (macOS has no EGL)
@@ -850,3 +851,533 @@ class TestBatchedPhysicsParity:
             "Batched walker damping missing TRANS_DAMPING on tx, ty DOFs"
         assert '0.0, 0.0, 0.0,\n            ROLL_DAMPING' not in source, \
             "Batched walker damping has 0.0 for tx, ty instead of TRANS_DAMPING"
+
+
+# ===================================================================
+# Hidden depth / detection threshold constants
+# ===================================================================
+
+class TestHiddenDepthConstants:
+    """Verify hide depths are safely below the z < -5 detection threshold."""
+
+    def test_batch_hidden_z_below_detection_threshold(self):
+        """BATCH_HIDDEN_Z must be below the z < -5 detection threshold."""
+        assert BATCH_HIDDEN_Z < -5, (
+            f"BATCH_HIDDEN_Z={BATCH_HIDDEN_Z} is not below detection threshold -5"
+        )
+
+    def test_batch_hidden_z_has_safety_margin(self):
+        """BATCH_HIDDEN_Z should be well below threshold (not borderline)."""
+        assert BATCH_HIDDEN_Z < -50, (
+            f"BATCH_HIDDEN_Z={BATCH_HIDDEN_Z} should have large margin below -5"
+        )
+
+    def test_single_env_hidden_z_below_threshold(self):
+        """Single-env hide depth (-10) must be below detection threshold."""
+        SINGLE_HIDDEN_Z = -10.0  # hardcoded in GenesisMazeScene
+        assert SINGLE_HIDDEN_Z < -5, (
+            f"Single-env hide depth {SINGLE_HIDDEN_Z} not below threshold -5"
+        )
+
+
+# ===================================================================
+# Batched contact check boundary tests
+# ===================================================================
+
+class TestBatchedContactBoundary:
+    """Boundary tests for the batched env's inline contact check in step().
+
+    The batched step() has its own contact detection code (inline Python
+    loops, NOT calling check_target_contacts), so it needs independent
+    boundary validation matching test_task20_24_changes.py.
+
+    Uses a single shared env (class-scoped) to avoid Genesis/pyglet resource
+    exhaustion from creating many scenes sequentially.
+    """
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _shared_env(self, _init_genesis, request):
+        """Create one BatchGenesisMemoryMazeEnv shared across all tests."""
+        env = BatchGenesisMemoryMazeEnv(
+            n_envs=1, maze_size=9, seed=42, camera_resolution=32,
+        )
+        request.cls._env = env
+        yield env
+        env.close()
+
+    def _setup_contact_test(self, target_distance):
+        """Reset env, place current target at given XY distance from walker.
+
+        Uses the walker's post-reset position (guaranteed safe at spawn).
+        Also moves non-current targets far away so _pick_new_target won't hang
+        if a reward is triggered.
+        """
+        env = self._env
+        env.reset()
+        walker_pos = env._scene.get_walker_positions()[0].copy()
+        t = int(env._current_target_ix[0])
+
+        # Move non-current targets far away first
+        for j in range(env._n_targets):
+            if j == t:
+                continue
+            far = np.array([walker_pos[0] + 5.0 + j, walker_pos[1], TARGET_RADIUS])
+            env._scene.set_target_pos(0, j, far.astype(np.float32))
+            env._target_positions[0, j] = far
+
+        target_pos = np.array([
+            walker_pos[0] + target_distance,
+            walker_pos[1],
+            TARGET_RADIUS,
+        ])
+        env._scene.set_target_pos(0, t, target_pos.astype(np.float32))
+        env._target_positions[0, t] = target_pos
+
+    def test_reward_at_0_5m(self):
+        """Walker 0.5m from current target -> should get reward."""
+        self._setup_contact_test(0.5)
+        _, rewards, _, _ = self._env.step([0])
+        assert rewards[0] > 0, f"Should reward at 0.5m, got {rewards[0]}"
+
+    def test_no_reward_at_1_2m(self):
+        """Walker 1.2m from current target -> should NOT get reward."""
+        self._setup_contact_test(1.2)
+        _, rewards, _, _ = self._env.step([0])
+        assert rewards[0] == 0.0, f"Should not reward at 1.2m, got {rewards[0]}"
+
+    def test_boundary_just_inside(self):
+        """Walker 0.79m from current target -> should get reward (< 0.8)."""
+        self._setup_contact_test(0.79)
+        _, rewards, _, _ = self._env.step([0])
+        assert rewards[0] > 0, f"Should reward at 0.79m, got {rewards[0]}"
+
+    def test_boundary_just_outside(self):
+        """Walker 0.81m from current target -> should NOT get reward (> 0.8)."""
+        self._setup_contact_test(0.81)
+        _, rewards, _, _ = self._env.step([0])
+        assert rewards[0] == 0.0, f"Should not reward at 0.81m, got {rewards[0]}"
+
+    def test_only_current_target_rewards(self):
+        """Only the current target gives reward, not other close targets."""
+        env = self._env
+        env.reset()
+        walker_pos = env._scene.get_walker_positions()[0].copy()
+        current = int(env._current_target_ix[0])
+        other = (current + 1) % env._n_targets
+
+        # Place non-current target very close (0.3m)
+        close_pos = np.array([walker_pos[0] + 0.3, walker_pos[1], TARGET_RADIUS])
+        env._scene.set_target_pos(0, other, close_pos.astype(np.float32))
+        env._target_positions[0, other] = close_pos
+        # Place current target far away (5m)
+        far_pos = np.array([walker_pos[0] + 5.0, walker_pos[1], TARGET_RADIUS])
+        env._scene.set_target_pos(0, current, far_pos.astype(np.float32))
+        env._target_positions[0, current] = far_pos
+
+        _, rewards, _, _ = env.step([0])
+        assert rewards[0] == 0.0, f"Non-current target should not reward, got {rewards[0]}"
+
+    def test_uses_2d_distance(self):
+        """Batched contact should use XY distance, ignoring Z."""
+        env = self._env
+        env.reset()
+        walker_pos = env._scene.get_walker_positions()[0].copy()
+        t = int(env._current_target_ix[0])
+
+        # Move all non-current targets far away so _pick_new_target won't hang
+        for j in range(env._n_targets):
+            if j == t:
+                continue
+            far = np.array([walker_pos[0] + 5.0 + j, walker_pos[1], TARGET_RADIUS])
+            env._scene.set_target_pos(0, j, far.astype(np.float32))
+            env._target_positions[0, j] = far
+
+        # XY distance = 0.5 (< 0.8), but Z is far away
+        target_pos = np.array([walker_pos[0] + 0.5, walker_pos[1], 5.0])
+        env._scene.set_target_pos(0, t, target_pos.astype(np.float32))
+        env._target_positions[0, t] = target_pos
+
+        _, rewards, _, _ = env.step([0])
+        assert rewards[0] > 0, f"Should use 2D distance (0.5 < 0.8), got {rewards[0]}"
+
+    def test_hidden_target_no_reward(self):
+        """Hidden target (z < -5) should not reward even at xy=0."""
+        env = self._env
+        env.reset()
+        walker_pos = env._scene.get_walker_positions()[0].copy()
+        t = int(env._current_target_ix[0])
+
+        target_pos = np.array([walker_pos[0], walker_pos[1], BATCH_HIDDEN_Z])
+        env._scene.set_target_pos(0, t, target_pos.astype(np.float32))
+        env._target_positions[0, t] = target_pos
+
+        _, rewards, _, _ = env.step([0])
+        assert rewards[0] == 0.0, f"Hidden target should not reward, got {rewards[0]}"
+
+
+# ===================================================================
+# Single-env vs batch scene physics parity (behavioral)
+# ===================================================================
+
+class TestSingleVsBatchPhysicsParity:
+    """Verify single-env and batch(n=1) scenes produce identical walker physics.
+
+    This is the behavioral complement to TestBatchedPhysicsParity's source
+    inspection. If these trajectories diverge, the scenes have different
+    physics parameters (mass, damping, friction, etc.).
+    """
+
+    def test_forward_trajectory_matches(self, _init_genesis):
+        """Same DOF forces -> same position in single and batch(n=1) scenes."""
+        # Build single-env scene
+        single = GenesisMazeScene(
+            maze_size=9, n_targets=3, camera_resolution=32, use_textures=False,
+        )
+        single.build()
+        rng = np.random.RandomState(42)
+        single.reset(rng)
+        for wall in single.wall_entities:
+            wall.set_pos(np.array([0.0, 0.0, -10.0]))
+        single.walker.set_pos(np.array([0.0, 0.0, WALKER_RADIUS]))
+        single.walker.set_quat(np.array([1.0, 0.0, 0.0, 0.0]))
+        single.walker.set_dofs_velocity(np.zeros(6))
+
+        # Build batch scene (1 env)
+        batch = BatchGenesisMazeScene(
+            n_envs=1, maze_size=9, n_targets=3, camera_resolution=32,
+            use_textures=False,
+        )
+        batch.build()
+        idx = torch.tensor([0], dtype=torch.int32)
+        hidden = np.array([0.0, 0.0, BATCH_HIDDEN_Z], dtype=np.float32)
+        for wall in batch.wall_entities:
+            wall.set_pos(hidden, envs_idx=idx)
+        batch.set_walker_pose(0, [0.0, 0.0], 0.0)
+
+        # Apply identical forward force for 20 control steps
+        force_single = np.array([ROLL_GEAR * -1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        force_batch = force_single.reshape(1, 6).astype(np.float32)
+        for _ in range(20):
+            single.walker.control_dofs_force(force_single)
+            single.step()
+            batch.apply_actions_batched(force_batch)
+            batch.step()
+
+        pos_single = single.get_walker_position()
+        pos_batch = batch.get_walker_positions()[0]
+
+        diff = np.linalg.norm(pos_single - pos_batch)
+        assert diff < 0.05, (
+            f"Single vs batch forward trajectory mismatch: diff={diff:.4f}, "
+            f"single={pos_single}, batch={pos_batch}"
+        )
+
+    def test_turning_trajectory_matches(self, _init_genesis):
+        """Same steer torque -> same angular velocity in both scenes."""
+        single = GenesisMazeScene(
+            maze_size=9, n_targets=3, camera_resolution=32, use_textures=False,
+        )
+        single.build()
+        rng = np.random.RandomState(42)
+        single.reset(rng)
+        for wall in single.wall_entities:
+            wall.set_pos(np.array([0.0, 0.0, -10.0]))
+        single.walker.set_pos(np.array([0.0, 0.0, WALKER_RADIUS]))
+        single.walker.set_quat(np.array([1.0, 0.0, 0.0, 0.0]))
+        single.walker.set_dofs_velocity(np.zeros(6))
+
+        batch = BatchGenesisMazeScene(
+            n_envs=1, maze_size=9, n_targets=3, camera_resolution=32,
+            use_textures=False,
+        )
+        batch.build()
+        idx = torch.tensor([0], dtype=torch.int32)
+        hidden = np.array([0.0, 0.0, BATCH_HIDDEN_Z], dtype=np.float32)
+        for wall in batch.wall_entities:
+            wall.set_pos(hidden, envs_idx=idx)
+        batch.set_walker_pose(0, [0.0, 0.0], 0.0)
+
+        # Apply steer torque for 20 steps
+        force = np.array([0.0, 0.0, 0.0, 0.0, 0.0, STEER_GEAR * 1.0])
+        force_batch = force.reshape(1, 6).astype(np.float32)
+        for _ in range(20):
+            single.walker.control_dofs_force(force)
+            single.step()
+            batch.apply_actions_batched(force_batch)
+            batch.step()
+
+        # Compare angular velocities (rz DOF)
+        vel_single = single.walker.get_dofs_velocity()
+        v_s = vel_single.cpu().numpy() if hasattr(vel_single, 'cpu') else np.asarray(vel_single)
+        vel_batch = batch.walker.get_dofs_velocity()
+        v_b = vel_batch.cpu().numpy() if hasattr(vel_batch, 'cpu') else np.asarray(vel_batch)
+        if v_b.ndim == 2:
+            v_b = v_b[0]
+
+        omega_diff = abs(float(v_s[5]) - float(v_b[5]))
+        assert omega_diff < 0.01, (
+            f"Single vs batch angular velocity mismatch: "
+            f"single_rz={v_s[5]:.4f}, batch_rz={v_b[5]:.4f}, diff={omega_diff:.4f}"
+        )
+
+
+# ===================================================================
+# Expanded source-inspection physics parity
+# ===================================================================
+
+class TestExpandedPhysicsParity:
+    """Extended source-code checks for single/batch constructor parity.
+
+    Complements TestBatchedPhysicsParity (which checks WALKER_FRICTION
+    and TRANS_DAMPING) with checks for all remaining physics constants.
+    """
+
+    def _get_single_source(self):
+        import inspect
+        return inspect.getsource(GenesisMazeScene.__init__)
+
+    def _get_batch_source(self):
+        import inspect
+        return inspect.getsource(BatchGenesisMazeScene.__init__)
+
+    def test_floor_friction_uses_constant(self):
+        """Both scenes should use FLOOR_FRICTION for the floor."""
+        single = self._get_single_source()
+        batch = self._get_batch_source()
+        assert 'friction=FLOOR_FRICTION' in single, \
+            "Single scene floor should use FLOOR_FRICTION"
+        assert 'friction=FLOOR_FRICTION' in batch, \
+            "Batch scene floor should use FLOOR_FRICTION"
+
+    def test_walker_radius_uses_constant(self):
+        """Both scenes should use WALKER_RADIUS for the walker sphere."""
+        single = self._get_single_source()
+        batch = self._get_batch_source()
+        assert 'radius=WALKER_RADIUS' in single, \
+            "Single scene walker should use WALKER_RADIUS"
+        assert 'radius=WALKER_RADIUS' in batch, \
+            "Batch scene walker should use WALKER_RADIUS"
+
+    def test_walker_mass_uses_constant(self):
+        """Both scenes should use WALKER_TOTAL_MASS for density calculation."""
+        single = self._get_single_source()
+        batch = self._get_batch_source()
+        assert 'WALKER_TOTAL_MASS' in single, \
+            "Single scene should reference WALKER_TOTAL_MASS"
+        assert 'WALKER_TOTAL_MASS' in batch, \
+            "Batch scene should reference WALKER_TOTAL_MASS"
+
+    def test_camera_fov_uses_constant(self):
+        """Both scenes should use CAMERA_FOV."""
+        single = self._get_single_source()
+        batch = self._get_batch_source()
+        assert 'fov=CAMERA_FOV' in single, \
+            "Single scene camera should use CAMERA_FOV"
+        assert 'fov=CAMERA_FOV' in batch, \
+            "Batch scene camera should use CAMERA_FOV"
+
+    def test_target_collision_disabled(self):
+        """Both scenes should have collision=False for targets."""
+        single = self._get_single_source()
+        batch = self._get_batch_source()
+        assert 'collision=False' in single, \
+            "Single scene targets should have collision=False"
+        assert 'collision=False' in batch, \
+            "Batch scene targets should have collision=False"
+
+    def test_walker_visualization_disabled(self):
+        """Both scenes should have visualization=False for walker."""
+        single = self._get_single_source()
+        batch = self._get_batch_source()
+        assert 'visualization=False' in single, \
+            "Single scene walker should have visualization=False"
+        assert 'visualization=False' in batch, \
+            "Batch scene walker should have visualization=False"
+
+    def test_steer_damping_in_build(self):
+        """Both builds should set STEER_DAMPING on rz DOF."""
+        import inspect
+        single_build = inspect.getsource(GenesisMazeScene.build)
+        batch_build = inspect.getsource(BatchGenesisMazeScene.build)
+        assert 'STEER_DAMPING' in single_build, \
+            "Single scene build should set STEER_DAMPING"
+        assert 'STEER_DAMPING' in batch_build, \
+            "Batch scene build should set STEER_DAMPING"
+
+    def test_roll_damping_in_build(self):
+        """Both builds should set ROLL_DAMPING on rx, ry DOFs."""
+        import inspect
+        single_build = inspect.getsource(GenesisMazeScene.build)
+        batch_build = inspect.getsource(BatchGenesisMazeScene.build)
+        assert 'ROLL_DAMPING' in single_build, \
+            "Single scene build should set ROLL_DAMPING"
+        assert 'ROLL_DAMPING' in batch_build, \
+            "Batch scene build should set ROLL_DAMPING"
+
+
+# ===================================================================
+# Render method consistency
+# ===================================================================
+
+class TestRenderConsistency:
+    """Verify render_single(i) matches render_all()[i].
+
+    Requires OpenGL 4.2+ (env_separate_rigid), so skipped on macOS.
+    """
+
+    @pytest.mark.skipif(
+        sys.platform == "darwin",
+        reason="Per-env Rasterizer rendering requires OpenGL 4.2 (not available on macOS)",
+    )
+    def test_render_single_matches_render_all(self, batch_scene_2):
+        """render_single(i) should produce identical pixels to render_all()[i]."""
+        import labmaze
+        for env_idx in range(2):
+            maze = labmaze.RandomMaze(
+                height=batch_scene_2.outer_size,
+                width=batch_scene_2.outer_size,
+                max_rooms=6, room_min_size=3, room_max_size=5,
+                spawns_per_room=1, objects_per_room=1,
+                random_seed=100 + env_idx,
+            )
+            segments = extract_wall_segments(maze)
+            batch_scene_2.configure_walls_for_env(env_idx, segments)
+            batch_scene_2.set_walker_pose(env_idx, [0.0, 0.0], env_idx * 0.5)
+
+        positions = batch_scene_2.get_walker_positions()
+        headings = np.array([0.0, 0.5])
+        batch_scene_2.update_cameras(positions, headings)
+
+        all_images = batch_scene_2.render_all()
+        for i in range(2):
+            single_img = batch_scene_2.render_single(i)
+            np.testing.assert_array_equal(
+                all_images[i], single_img,
+                err_msg=f"render_single({i}) != render_all()[{i}]",
+            )
+
+
+# ===================================================================
+# Auto-reset observation correctness
+# ===================================================================
+
+class TestAutoResetObservation:
+    """Verify observations after auto-reset are from the new episode.
+
+    Uses a single shared env (class-scoped) to avoid Genesis scene exhaustion.
+    """
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _shared_env(self, _init_genesis, request):
+        """Create one BatchGenesisMemoryMazeEnv shared across tests."""
+        env = BatchGenesisMemoryMazeEnv(
+            n_envs=1, maze_size=9, seed=42, camera_resolution=32,
+        )
+        request.cls._env = env
+        yield env
+        env.close()
+
+    def test_obs_after_auto_reset_is_valid(self):
+        """After done+auto-reset, returned obs is valid and state is reset."""
+        env = self._env
+        env.reset()
+        max_steps = env._max_steps
+
+        # Step to one before done
+        for _ in range(max_steps - 1):
+            env.step([0])
+
+        assert env._step_counts[0] == max_steps - 1
+
+        # This step triggers done + auto-reset
+        obs, _, dones, infos = env.step([0])
+        assert dones[0], "Should be done at max_steps"
+
+        # After auto-reset, internal state should reflect new episode
+        assert env._step_counts[0] == 0, (
+            f"Step count should be 0 after reset, got {env._step_counts[0]}"
+        )
+        assert env._targets_obtained[0] == 0, (
+            f"Targets obtained should be 0, got {env._targets_obtained[0]}"
+        )
+
+        # Observation should be valid (not blank/corrupted)
+        assert obs.shape == (1, 32, 32, 3)
+        assert obs.dtype == np.uint8
+        assert np.std(obs[0].astype(np.float32)) > 3.0, (
+            "Post-reset obs appears blank/uniform"
+        )
+
+    def test_auto_reset_produces_different_maze(self):
+        """Auto-reset should produce a new maze (different observation)."""
+        env = self._env
+        first_obs = env.reset().copy()
+
+        # Run full episode
+        for _ in range(env._max_steps - 1):
+            env.step([1])
+        obs_after_reset, _, dones, _ = env.step([1])
+        assert dones[0]
+
+        # New episode obs should differ (different maze/spawn)
+        diff = np.mean(np.abs(
+            first_obs[0].astype(np.float32) - obs_after_reset[0].astype(np.float32)
+        ))
+        assert diff > 0.5, (
+            f"Auto-reset obs too similar to first episode: diff={diff:.1f}"
+        )
+
+
+# ===================================================================
+# _pick_new_target degenerate case
+# ===================================================================
+
+class TestPickNewTargetDegenerate:
+    """Test behavior when all targets are within activation distance."""
+
+    @pytest.mark.xfail(
+        reason="_pick_new_target has no guard against infinite loop",
+        strict=False,
+    )
+    def test_pick_new_target_terminates_when_all_close(self, _init_genesis):
+        """_pick_new_target should not hang when all targets are nearby.
+
+        Current code has a while True loop with no escape hatch.
+        This test documents the issue and will pass once a guard
+        (max iterations + fallback) is added.
+        """
+        import threading
+
+        env = GenesisMemoryMazeEnv(maze_size=9, camera_resolution=32, seed=42)
+        env.reset()
+
+        # Place all targets within activation distance of walker
+        walker_pos = env._scene.get_walker_position()
+        for i in range(env._n_targets):
+            close_pos = np.array([
+                walker_pos[0] + 0.3,
+                walker_pos[1] + 0.1 * i,
+                TARGET_RADIUS,
+            ])
+            env._scene.target_entities[i].set_pos(close_pos)
+            env._scene._target_world_positions[i] = close_pos.copy()
+            env._target_world_positions[i] = close_pos.copy()
+
+        completed = [False]
+
+        def run():
+            try:
+                env._pick_new_target()
+                completed[0] = True
+            except Exception:
+                completed[0] = True  # exception is better than hang
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(timeout=2.0)
+
+        assert completed[0], (
+            "_pick_new_target stuck in infinite loop when all targets "
+            "are within activation distance"
+        )
+        env.close()

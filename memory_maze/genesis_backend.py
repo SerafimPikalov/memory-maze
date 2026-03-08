@@ -773,6 +773,7 @@ class GenesisMemoryMazeEnv(gym.Env):
         control_freq=DEFAULT_CONTROL_FREQ,
         physics_timestep=DEFAULT_PHYSICS_TIMESTEP,
         use_textures=True,
+        use_batch_renderer=None,
         **kwargs,
     ):
         super().__init__()
@@ -793,6 +794,7 @@ class GenesisMemoryMazeEnv(gym.Env):
         self._time_limit = time_limit
         self._camera_resolution = camera_resolution
         self._control_freq = control_freq
+        self._use_batch_renderer = use_batch_renderer
 
         control_timestep = 1.0 / control_freq
         z_height = 0.4 if good_visibility else 1.5
@@ -813,11 +815,15 @@ class GenesisMemoryMazeEnv(gym.Env):
         self._seed = seed
         self._rng = np.random.RandomState(seed)
 
-        # Initialize Genesis (skip if already initialized)
-        # Single-env mode is used by forked actor processes — CUDA can't be
-        # reinitialized in forked subprocesses, so always use CPU backend.
+        # Initialize Genesis (skip if already initialized).
+        # Default: CPU backend (safe for forked actor subprocesses).
+        # use_batch_renderer=True requires CUDA — caller must ensure
+        # gs.init(backend=gs.cuda) was called before constructing this env.
         if not gs._initialized:
-            gs.init(backend=gs.cpu, logging_level='warning')
+            if use_batch_renderer:
+                gs.init(backend=gs.cuda, logging_level='warning')
+            else:
+                gs.init(backend=gs.cpu, logging_level='warning')
 
         # Build scene
         self._scene = GenesisMazeScene(
