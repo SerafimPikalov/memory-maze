@@ -27,7 +27,9 @@ pytestmark = pytest.mark.skipif(not HAS_GENESIS, reason="Genesis not installed")
 from memory_maze.genesis_backend import (
     ACTION_SET,
     BATCH_HIDDEN_Z,
+    HIDDEN_Z,
     CAMERA_FOV,
+    FLOOR_FRICTION,
     ROLL_DAMPING,
     ROLL_GEAR,
     STEER_DAMPING,
@@ -39,6 +41,7 @@ from memory_maze.genesis_backend import (
     WALKER_CAMERA_HEIGHT,
     WALKER_FRICTION,
     WALKER_RADIUS,
+    WALKER_TOTAL_MASS,
     BatchGenesisMemoryMazeEnv,
     BatchGenesisMazeScene,
     GenesisMemoryMazeEnv,
@@ -830,27 +833,38 @@ class TestTrainingSmokeTest:
 class TestBatchedPhysicsParity:
     """Verify batched scene uses the same physics constants as non-batched.
 
-    Catches copy-paste bugs like hardcoded friction/damping values that
-    diverge from the tuned constants (e.g. friction=0.5 vs WALKER_FRICTION=0.01).
+    Uses runtime checks on built scenes — resilient to refactoring that moves
+    constants from subclass __init__ to a shared base class.
     """
 
-    def test_walker_friction_uses_constant(self):
-        """Batched walker friction must match WALKER_FRICTION, not a hardcoded value."""
-        import inspect
-        source = inspect.getsource(BatchGenesisMazeScene.__init__)
-        assert 'friction=0.5,\n                rho=WALKER_TOTAL_MASS' not in source, \
-            "Batched walker uses hardcoded friction=0.5 instead of WALKER_FRICTION"
-        assert 'friction=WALKER_FRICTION' in source, \
-            "Batched walker friction should use WALKER_FRICTION constant"
+    def test_walker_friction_matches(self, _init_genesis):
+        """Both scenes should use WALKER_FRICTION for the walker."""
+        single = GenesisMazeScene(maze_size=9, n_targets=3, camera_resolution=32, use_textures=False)
+        single.build()
+        batch = BatchGenesisMazeScene(n_envs=1, maze_size=9, n_targets=3, camera_resolution=32, use_textures=False)
+        batch.build()
+        # Both walkers should have the same friction (via geoms[0])
+        s_fric = float(single.walker.geoms[0].friction)
+        b_fric = float(batch.walker.geoms[0].friction)
+        assert s_fric == b_fric == WALKER_FRICTION, (
+            f"Walker friction mismatch: single={s_fric}, batch={b_fric}, expected={WALKER_FRICTION}"
+        )
 
-    def test_walker_damping_has_trans_damping(self):
-        """Batched walker damping must include TRANS_DAMPING on tx, ty DOFs."""
-        import inspect
-        source = inspect.getsource(BatchGenesisMazeScene.build)
-        assert 'TRANS_DAMPING, TRANS_DAMPING, 0.0' in source, \
-            "Batched walker damping missing TRANS_DAMPING on tx, ty DOFs"
-        assert '0.0, 0.0, 0.0,\n            ROLL_DAMPING' not in source, \
-            "Batched walker damping has 0.0 for tx, ty instead of TRANS_DAMPING"
+    def test_walker_damping_matches(self, _init_genesis):
+        """Both scenes should have identical DOF damping (TRANS_DAMPING, ROLL_DAMPING, STEER_DAMPING)."""
+        single = GenesisMazeScene(maze_size=9, n_targets=3, camera_resolution=32, use_textures=False)
+        single.build()
+        batch = BatchGenesisMazeScene(n_envs=1, maze_size=9, n_targets=3, camera_resolution=32, use_textures=False)
+        batch.build()
+        s_damp = single.walker.get_dofs_damping()
+        s_damp = s_damp.cpu().numpy() if hasattr(s_damp, 'cpu') else np.asarray(s_damp)
+        b_damp = batch.walker.get_dofs_damping()
+        b_damp = b_damp.cpu().numpy() if hasattr(b_damp, 'cpu') else np.asarray(b_damp)
+        if b_damp.ndim == 2:
+            b_damp = b_damp[0]
+        expected = np.array([TRANS_DAMPING, TRANS_DAMPING, 0.0, ROLL_DAMPING, ROLL_DAMPING, STEER_DAMPING])
+        np.testing.assert_allclose(s_damp, expected, err_msg="Single scene damping mismatch")
+        np.testing.assert_allclose(b_damp, expected, err_msg="Batch scene damping mismatch")
 
 
 # ===================================================================
@@ -872,11 +886,13 @@ class TestHiddenDepthConstants:
             f"BATCH_HIDDEN_Z={BATCH_HIDDEN_Z} should have large margin below -5"
         )
 
-    def test_single_env_hidden_z_below_threshold(self):
-        """Single-env hide depth (-10) must be below detection threshold."""
-        SINGLE_HIDDEN_Z = -10.0  # hardcoded in GenesisMazeScene
-        assert SINGLE_HIDDEN_Z < -5, (
-            f"Single-env hide depth {SINGLE_HIDDEN_Z} not below threshold -5"
+    def test_hidden_z_alias_matches(self):
+        """BATCH_HIDDEN_Z must equal the unified HIDDEN_Z constant."""
+        assert BATCH_HIDDEN_Z == HIDDEN_Z, (
+            f"BATCH_HIDDEN_Z={BATCH_HIDDEN_Z} != HIDDEN_Z={HIDDEN_Z}"
+        )
+        assert HIDDEN_Z < -5, (
+            f"HIDDEN_Z={HIDDEN_Z} not below detection threshold -5"
         )
 
 
@@ -1126,93 +1142,101 @@ class TestSingleVsBatchPhysicsParity:
 # ===================================================================
 
 class TestExpandedPhysicsParity:
-    """Extended source-code checks for single/batch constructor parity.
+    """Runtime checks for single/batch scene physics parity.
 
-    Complements TestBatchedPhysicsParity (which checks WALKER_FRICTION
-    and TRANS_DAMPING) with checks for all remaining physics constants.
+    Verifies actual parameter values on built scenes rather than inspecting
+    source code. Resilient to refactoring that moves code between classes.
     """
 
-    def _get_single_source(self):
-        import inspect
-        return inspect.getsource(GenesisMazeScene.__init__)
-
-    def _get_batch_source(self):
-        import inspect
-        return inspect.getsource(BatchGenesisMazeScene.__init__)
+    @pytest.fixture(autouse=True, scope="class")
+    def _build_scenes(self, _init_genesis, request):
+        """Build one single-env and one batch(n=1) scene for all tests."""
+        single = GenesisMazeScene(
+            maze_size=9, n_targets=3, camera_resolution=32, use_textures=False,
+        )
+        single.build()
+        batch = BatchGenesisMazeScene(
+            n_envs=1, maze_size=9, n_targets=3, camera_resolution=32, use_textures=False,
+        )
+        batch.build()
+        request.cls._single = single
+        request.cls._batch = batch
 
     def test_floor_friction_uses_constant(self):
         """Both scenes should use FLOOR_FRICTION for the floor."""
-        single = self._get_single_source()
-        batch = self._get_batch_source()
-        assert 'friction=FLOOR_FRICTION' in single, \
-            "Single scene floor should use FLOOR_FRICTION"
-        assert 'friction=FLOOR_FRICTION' in batch, \
-            "Batch scene floor should use FLOOR_FRICTION"
+        s_fric = float(self._single.floor.geoms[0].friction)
+        b_fric = float(self._batch.floor.geoms[0].friction)
+        assert s_fric == FLOOR_FRICTION, f"Single floor friction={s_fric}, expected={FLOOR_FRICTION}"
+        assert b_fric == FLOOR_FRICTION, f"Batch floor friction={b_fric}, expected={FLOOR_FRICTION}"
 
     def test_walker_radius_uses_constant(self):
         """Both scenes should use WALKER_RADIUS for the walker sphere."""
-        single = self._get_single_source()
-        batch = self._get_batch_source()
-        assert 'radius=WALKER_RADIUS' in single, \
-            "Single scene walker should use WALKER_RADIUS"
-        assert 'radius=WALKER_RADIUS' in batch, \
-            "Batch scene walker should use WALKER_RADIUS"
+        s_radius = float(self._single.walker.morph.radius)
+        b_radius = float(self._batch.walker.morph.radius)
+        assert abs(s_radius - WALKER_RADIUS) < 1e-6, f"Single walker radius={s_radius}"
+        assert abs(b_radius - WALKER_RADIUS) < 1e-6, f"Batch walker radius={b_radius}"
 
-    def test_walker_mass_uses_constant(self):
-        """Both scenes should use WALKER_TOTAL_MASS for density calculation."""
-        single = self._get_single_source()
-        batch = self._get_batch_source()
-        assert 'WALKER_TOTAL_MASS' in single, \
-            "Single scene should reference WALKER_TOTAL_MASS"
-        assert 'WALKER_TOTAL_MASS' in batch, \
-            "Batch scene should reference WALKER_TOTAL_MASS"
+    def test_walker_mass_matches(self):
+        """Both scenes should produce the same total walker mass from WALKER_TOTAL_MASS."""
+        # Check mass via density * volume = WALKER_TOTAL_MASS
+        vol = (4.0 / 3.0) * math.pi * WALKER_RADIUS ** 3
+        expected_rho = WALKER_TOTAL_MASS / vol
+        s_rho = float(self._single.walker.material.rho)
+        b_rho = float(self._batch.walker.material.rho)
+        assert abs(s_rho - expected_rho) < 1.0, f"Single walker rho={s_rho}, expected={expected_rho}"
+        assert abs(b_rho - expected_rho) < 1.0, f"Batch walker rho={b_rho}, expected={expected_rho}"
 
     def test_camera_fov_uses_constant(self):
         """Both scenes should use CAMERA_FOV."""
-        single = self._get_single_source()
-        batch = self._get_batch_source()
-        assert 'fov=CAMERA_FOV' in single, \
-            "Single scene camera should use CAMERA_FOV"
-        assert 'fov=CAMERA_FOV' in batch, \
-            "Batch scene camera should use CAMERA_FOV"
+        # Single-env has one camera; batch with Rasterizer has per-env cameras
+        s_fov = self._single.camera.fov
+        if self._batch.camera is not None:
+            b_fov = self._batch.camera.fov
+        else:
+            b_fov = self._batch.cameras[0].fov
+        assert s_fov == CAMERA_FOV, f"Single camera fov={s_fov}, expected={CAMERA_FOV}"
+        assert b_fov == CAMERA_FOV, f"Batch camera fov={b_fov}, expected={CAMERA_FOV}"
 
     def test_target_collision_disabled(self):
-        """Both scenes should have collision=False for targets."""
-        single = self._get_single_source()
-        batch = self._get_batch_source()
-        assert 'collision=False' in single, \
-            "Single scene targets should have collision=False"
-        assert 'collision=False' in batch, \
-            "Batch scene targets should have collision=False"
+        """Both scenes should have collision disabled for targets."""
+        for i in range(self._single.n_targets):
+            # collision=False means morph.collision is False and no geoms are created
+            assert not self._single.target_entities[i].morph.collision, \
+                f"Single target {i} has collision enabled"
+        for i in range(self._batch.n_targets):
+            assert not self._batch.target_entities[i].morph.collision, \
+                f"Batch target {i} has collision enabled"
 
-    def test_walker_visualization_disabled(self):
-        """Both scenes should have visualization=False for walker."""
-        single = self._get_single_source()
-        batch = self._get_batch_source()
-        assert 'visualization=False' in single, \
-            "Single scene walker should have visualization=False"
-        assert 'visualization=False' in batch, \
-            "Batch scene walker should have visualization=False"
+    def test_walker_not_visible(self):
+        """Both scenes should have visualization=False for walker (invisible to camera)."""
+        assert not self._single.walker.morph.visualization, \
+            "Single walker should have visualization=False"
+        assert not self._batch.walker.morph.visualization, \
+            "Batch walker should have visualization=False"
 
     def test_steer_damping_in_build(self):
-        """Both builds should set STEER_DAMPING on rz DOF."""
-        import inspect
-        single_build = inspect.getsource(GenesisMazeScene.build)
-        batch_build = inspect.getsource(BatchGenesisMazeScene.build)
-        assert 'STEER_DAMPING' in single_build, \
-            "Single scene build should set STEER_DAMPING"
-        assert 'STEER_DAMPING' in batch_build, \
-            "Batch scene build should set STEER_DAMPING"
+        """Both builds should set STEER_DAMPING on rz DOF (index 5)."""
+        s_damp = self._single.walker.get_dofs_damping()
+        s_damp = s_damp.cpu().numpy() if hasattr(s_damp, 'cpu') else np.asarray(s_damp)
+        b_damp = self._batch.walker.get_dofs_damping()
+        b_damp = b_damp.cpu().numpy() if hasattr(b_damp, 'cpu') else np.asarray(b_damp)
+        if b_damp.ndim == 2:
+            b_damp = b_damp[0]
+        assert abs(float(s_damp[5]) - STEER_DAMPING) < 1e-6, f"Single rz damping={s_damp[5]}"
+        assert abs(float(b_damp[5]) - STEER_DAMPING) < 1e-6, f"Batch rz damping={b_damp[5]}"
 
     def test_roll_damping_in_build(self):
-        """Both builds should set ROLL_DAMPING on rx, ry DOFs."""
-        import inspect
-        single_build = inspect.getsource(GenesisMazeScene.build)
-        batch_build = inspect.getsource(BatchGenesisMazeScene.build)
-        assert 'ROLL_DAMPING' in single_build, \
-            "Single scene build should set ROLL_DAMPING"
-        assert 'ROLL_DAMPING' in batch_build, \
-            "Batch scene build should set ROLL_DAMPING"
+        """Both builds should set ROLL_DAMPING on rx, ry DOFs (indices 3, 4)."""
+        s_damp = self._single.walker.get_dofs_damping()
+        s_damp = s_damp.cpu().numpy() if hasattr(s_damp, 'cpu') else np.asarray(s_damp)
+        b_damp = self._batch.walker.get_dofs_damping()
+        b_damp = b_damp.cpu().numpy() if hasattr(b_damp, 'cpu') else np.asarray(b_damp)
+        if b_damp.ndim == 2:
+            b_damp = b_damp[0]
+        assert abs(float(s_damp[3]) - ROLL_DAMPING) < 1e-6, f"Single rx damping={s_damp[3]}"
+        assert abs(float(s_damp[4]) - ROLL_DAMPING) < 1e-6, f"Single ry damping={s_damp[4]}"
+        assert abs(float(b_damp[3]) - ROLL_DAMPING) < 1e-6, f"Batch rx damping={b_damp[3]}"
+        assert abs(float(b_damp[4]) - ROLL_DAMPING) < 1e-6, f"Batch ry damping={b_damp[4]}"
 
 
 # ===================================================================
@@ -1329,22 +1353,146 @@ class TestAutoResetObservation:
 
 
 # ===================================================================
+# Multi-env contact boundary (n_envs=2)
+# ===================================================================
+
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="Per-env Rasterizer rendering requires OpenGL 4.2 (not available on macOS)",
+)
+class TestMultiEnvContactBoundary:
+    """Verify contact check works correctly with n_envs=2.
+
+    Guards against bugs that only manifest with multiple environments
+    (e.g., reward applied to wrong env, target indices mixed up).
+    Requires OpenGL 4.2+ for per-env Rasterizer rendering.
+    """
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _shared_env(self, _init_genesis, request):
+        env = BatchGenesisMemoryMazeEnv(
+            n_envs=2, maze_size=9, seed=42, camera_resolution=32,
+        )
+        request.cls._env = env
+        yield env
+        env.close()
+
+    def test_simultaneous_rewards_both_envs(self):
+        """Both envs can get rewards simultaneously when both touch their targets."""
+        env = self._env
+        env.reset()
+
+        for i in range(2):
+            walker_pos = env._scene.get_walker_positions()[i].copy()
+            t = int(env._current_target_ix[i])
+            # Move non-current targets far away
+            for j in range(env._n_targets):
+                if j == t:
+                    continue
+                far = np.array([walker_pos[0] + 5.0 + j, walker_pos[1], TARGET_RADIUS])
+                env._scene.set_target_pos(i, j, far.astype(np.float32))
+                env._target_positions[i, j] = far
+            # Place current target close (0.5m)
+            target_pos = np.array([walker_pos[0] + 0.5, walker_pos[1], TARGET_RADIUS])
+            env._scene.set_target_pos(i, t, target_pos.astype(np.float32))
+            env._target_positions[i, t] = target_pos
+
+        _, rewards, _, _ = env.step([0, 0])
+        assert rewards[0] > 0, f"Env 0 should get reward, got {rewards[0]}"
+        assert rewards[1] > 0, f"Env 1 should get reward, got {rewards[1]}"
+
+    def test_independent_rewards_per_env(self):
+        """Only the env touching its target gets a reward, not the other."""
+        env = self._env
+        env.reset()
+
+        # Env 0: place current target close
+        walker0 = env._scene.get_walker_positions()[0].copy()
+        t0 = int(env._current_target_ix[0])
+        for j in range(env._n_targets):
+            if j == t0:
+                continue
+            far = np.array([walker0[0] + 5.0 + j, walker0[1], TARGET_RADIUS])
+            env._scene.set_target_pos(0, j, far.astype(np.float32))
+            env._target_positions[0, j] = far
+        close_pos = np.array([walker0[0] + 0.5, walker0[1], TARGET_RADIUS])
+        env._scene.set_target_pos(0, t0, close_pos.astype(np.float32))
+        env._target_positions[0, t0] = close_pos
+
+        # Env 1: place current target far
+        walker1 = env._scene.get_walker_positions()[1].copy()
+        t1 = int(env._current_target_ix[1])
+        far_pos = np.array([walker1[0] + 5.0, walker1[1], TARGET_RADIUS])
+        env._scene.set_target_pos(1, t1, far_pos.astype(np.float32))
+        env._target_positions[1, t1] = far_pos
+
+        _, rewards, _, _ = env.step([0, 0])
+        assert rewards[0] > 0, f"Env 0 should get reward, got {rewards[0]}"
+        assert rewards[1] == 0.0, f"Env 1 should NOT get reward, got {rewards[1]}"
+
+
+# ===================================================================
+# Wall texture group assignment
+# ===================================================================
+
+class TestWallTextureGroupAssignment:
+    """Verify wall entities are correctly assigned to texture groups."""
+
+    def test_textured_walls_have_groups(self, _init_genesis):
+        """Scene with textures should have 9 wall groups ('0'-'8')."""
+        scene = GenesisMazeScene(
+            maze_size=9, n_targets=3, camera_resolution=32, use_textures=True,
+        )
+        assert scene._wall_groups is not None, "Textured scene should have _wall_groups"
+        assert len(scene._wall_groups) == 9, f"Expected 9 groups, got {len(scene._wall_groups)}"
+        for i in range(9):
+            assert str(i) in scene._wall_groups, f"Group '{i}' missing"
+
+    def test_batch_textured_walls_have_groups(self, _init_genesis):
+        """Batch scene with textures should also have 9 wall groups."""
+        scene = BatchGenesisMazeScene(
+            n_envs=1, maze_size=9, n_targets=3, camera_resolution=32, use_textures=True,
+        )
+        assert scene._wall_groups is not None
+        assert len(scene._wall_groups) == 9
+
+    def test_no_textures_no_groups(self, _init_genesis):
+        """Scene without textures should have _wall_groups=None."""
+        scene = GenesisMazeScene(
+            maze_size=9, n_targets=3, camera_resolution=32, use_textures=False,
+        )
+        assert scene._wall_groups is None
+
+    def test_shuffled_wall_groups_returns_copy(self, _init_genesis):
+        """shuffled_wall_groups() should return a new dict, not mutate original."""
+        scene = BatchGenesisMazeScene(
+            n_envs=1, maze_size=9, n_targets=3, camera_resolution=32, use_textures=True,
+        )
+        original_groups = {k: v for k, v in scene._wall_groups.items()}
+        rng = np.random.RandomState(42)
+        shuffled = scene.shuffled_wall_groups(rng)
+
+        # Shuffled should be a different dict object
+        assert shuffled is not scene._wall_groups, "Should return a new dict"
+        # Original should be unchanged (same entity references per key)
+        for k in original_groups:
+            assert scene._wall_groups[k] is original_groups[k], (
+                f"Original group '{k}' was mutated"
+            )
+
+
+# ===================================================================
 # _pick_new_target degenerate case
 # ===================================================================
 
 class TestPickNewTargetDegenerate:
     """Test behavior when all targets are within activation distance."""
 
-    @pytest.mark.xfail(
-        reason="_pick_new_target has no guard against infinite loop",
-        strict=False,
-    )
     def test_pick_new_target_terminates_when_all_close(self, _init_genesis):
-        """_pick_new_target should not hang when all targets are nearby.
+        """_pick_new_target terminates with fallback when all targets are nearby.
 
-        Current code has a while True loop with no escape hatch.
-        This test documents the issue and will pass once a guard
-        (max iterations + fallback) is added.
+        Fixed: _pick_new_target now has max_attempts=100 with fallback to
+        (current_ix + 1) % n_targets.
         """
         import threading
 

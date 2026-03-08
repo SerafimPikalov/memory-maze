@@ -194,9 +194,11 @@ def main():
     scene._maze._entity_layer[:] = entity_layer
     if scene.use_textures:
         _apply_block_variations(scene._maze)
-        scene.shuffle_wall_textures(rng)
+        shuffled = scene.shuffled_wall_groups(rng)
+    else:
+        shuffled = None
     wall_segments = extract_wall_cells(scene._maze, scene.xy_scale, scene.z_height)
-    scene._configure_walls(wall_segments)
+    scene._configure_walls_for_env(0, wall_segments, wall_groups=shuffled)
 
     # Place walker at exact same position/heading
     scene.walker.set_pos(np.array([agent_world[0], agent_world[1], WALKER_RADIUS]))
