@@ -889,6 +889,21 @@ def _pick_new_target(rng, current_ix, target_positions, walker_pos,
     return fallback
 
 
+def _draw_border(img, target_ix, camera_resolution):
+    """Draw target color border on an image (in-place).
+
+    Shared by both single-env and batch-env wrappers.
+    Border width scales with resolution: 2px at 64x64.
+    """
+    color = TARGET_COLORS[target_ix]
+    B = int(2 * math.sqrt(camera_resolution / 64))
+    border_color = (color * 255 * _BORDER_DIM_FACTOR).astype(np.uint8)
+    img[:, :B] = border_color
+    img[:, -B:] = border_color
+    img[:B, :] = border_color
+    img[-B:, :] = border_color
+
+
 # ---------------------------------------------------------------------------
 # Phase 4: Full Gym Wrapper
 # ---------------------------------------------------------------------------
@@ -1070,14 +1085,7 @@ class GenesisMemoryMazeEnv(gym.Env):
             img = np.array(pil_img)
 
         # Draw target color border (same as TargetColorAsBorderWrapper)
-        color = self._target_colors[self._current_target_ix]
-        B = int(2 * math.sqrt(self._camera_resolution / 64))
-        border_color = (color * 255 * _BORDER_DIM_FACTOR).astype(np.uint8)
-        img[:, :B] = border_color
-        img[:, -B:] = border_color
-        img[:B, :] = border_color
-        img[-B:, :] = border_color
-
+        _draw_border(img, self._current_target_ix, self._camera_resolution)
         return img
 
     def render(self, mode='rgb_array'):
@@ -1592,13 +1600,7 @@ class BatchGenesisMemoryMazeEnv:
 
     def _draw_border(self, img, target_ix):
         """Draw target color border on an image (in-place)."""
-        color = TARGET_COLORS[target_ix]
-        B = int(2 * math.sqrt(self._camera_resolution / 64))
-        border_color = (color * 255 * _BORDER_DIM_FACTOR).astype(np.uint8)
-        img[:, :B] = border_color
-        img[:, -B:] = border_color
-        img[:B, :] = border_color
-        img[-B:, :] = border_color
+        _draw_border(img, target_ix, self._camera_resolution)
 
     def close(self):
         """Clean up resources."""
