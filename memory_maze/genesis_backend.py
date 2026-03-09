@@ -1492,7 +1492,7 @@ class BatchGenesisMemoryMazeEnv:
         for i, t in zip(*np.where(hit)):
             rewards[i] = 1.0
             self._targets_obtained[i] += 1
-            self._pick_new_target(i)
+            self._pick_new_target(i, positions[i])
 
         # 6. Update cameras and render
         self._scene.update_cameras(positions, self._walker_headings)
@@ -1590,9 +1590,15 @@ class BatchGenesisMemoryMazeEnv:
         self._targets_obtained[env_idx] = 0
         self._current_target_ix[env_idx] = rng.randint(self._n_targets)
 
-    def _pick_new_target(self, env_idx):
-        """Pick a new random target for an environment (not within activation distance)."""
-        walker_pos = self._scene.get_walker_positions()[env_idx]  # (3,)
+    def _pick_new_target(self, env_idx, walker_pos):
+        """Pick a new random target for an environment (not within activation distance).
+
+        Parameters
+        ----------
+        env_idx : int
+        walker_pos : np.ndarray, shape (3,)
+            Pre-fetched walker position (avoids redundant GPU->CPU transfer).
+        """
         self._current_target_ix[env_idx] = _pick_new_target(
             self._rngs[env_idx], int(self._current_target_ix[env_idx]),
             self._target_positions[env_idx], walker_pos, self._n_targets,
