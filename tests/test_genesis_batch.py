@@ -42,6 +42,7 @@ from memory_maze.genesis_backend import (
     WALKER_FRICTION,
     WALKER_RADIUS,
     WALKER_TOTAL_MASS,
+    _UNDERGROUND_THRESHOLD,
     BatchGenesisMemoryMazeEnv,
     BatchGenesisMazeScene,
     GenesisMemoryMazeEnv,
@@ -1627,7 +1628,7 @@ class TestResetDeterminism:
             for w in scene.wall_entities:
                 pos = w.get_pos()
                 p = pos.cpu().numpy() if hasattr(pos, 'cpu') else np.asarray(pos)
-                if p[2] > -5:
+                if p[2] > _UNDERGROUND_THRESHOLD:
                     wall_pos.append(p.copy())
             positions_per_run.append(sorted([tuple(p) for p in wall_pos]))
         assert positions_per_run[0] == positions_per_run[1], \

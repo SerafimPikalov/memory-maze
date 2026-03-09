@@ -114,6 +114,13 @@ DEFAULT_CONTROL_TIMESTEP = 1.0 / DEFAULT_CONTROL_FREQ  # 0.25s
 # Texture support
 N_WALL_GROUPS = 9   # '0'-'8' spatial blocks from TextMazeVaryingWalls
 
+# Rendering / display
+_UNDERGROUND_THRESHOLD = -5.0   # z below this = hidden/inactive target
+_BORDER_DIM_FACTOR = 0.7        # multiply target color for border dimming
+_CAMERA_LOOK_DIST = 1.0         # forward distance for camera lookat point
+_CAMERA_LOOKAT_DOWN = 0.1       # downward offset for camera lookat
+_SEED_MAX = 2**31               # max seed for labmaze RandomMaze
+
 # ---------------------------------------------------------------------------
 # Lighting — cardinal directional lights for direction-independent walls.
 #
@@ -683,7 +690,7 @@ class GenesisMazeScene(_BaseMazeScene):
 
         # Create maze once, then regenerate on each reset (matches MuJoCo lifecycle)
         if self._maze is None:
-            seed = rng.randint(2147483648)
+            seed = rng.randint(_SEED_MAX)
             self._maze = labmaze.RandomMaze(
                 height=self.outer_size,
                 width=self.outer_size,
@@ -814,11 +821,11 @@ class GenesisMazeScene(_BaseMazeScene):
         cam_z = walker_pos[2] + WALKER_CAMERA_HEIGHT
         cam_pos = np.array([cam_x, cam_y, cam_z])
         # Look direction: forward along heading, slightly downward
-        look_dist = 1.0
+        look_dist = _CAMERA_LOOK_DIST
         lookat = np.array([
             cam_x + look_dist * math.cos(heading),
             cam_y + look_dist * math.sin(heading),
-            cam_z - 0.1,
+            cam_z - _CAMERA_LOOKAT_DOWN,
         ])
         self.camera.set_pose(pos=cam_pos, lookat=lookat, up=(0, 0, 1))
 
@@ -840,7 +847,7 @@ class GenesisMazeScene(_BaseMazeScene):
         contacts = np.zeros(self.n_targets, dtype=bool)
         for i in range(self.n_targets):
             tpos = self._target_world_positions[i]
-            if tpos[2] < -5:  # Underground = not active
+            if tpos[2] < _UNDERGROUND_THRESHOLD:  # Underground = not active
                 continue
             dist = np.linalg.norm(walker_pos[:2] - tpos[:2])
             contacts[i] = dist < TARGET_ACTIVATION_GAP
@@ -1065,7 +1072,7 @@ class GenesisMemoryMazeEnv(gym.Env):
         # Draw target color border (same as TargetColorAsBorderWrapper)
         color = self._target_colors[self._current_target_ix]
         B = int(2 * math.sqrt(self._camera_resolution / 64))
-        border_color = (color * 255 * 0.7).astype(np.uint8)
+        border_color = (color * 255 * _BORDER_DIM_FACTOR).astype(np.uint8)
         img[:, :B] = border_color
         img[:, -B:] = border_color
         img[:B, :] = border_color
@@ -1236,11 +1243,11 @@ class BatchGenesisMazeScene(_BaseMazeScene):
         cam_z = positions[:, 2] + WALKER_CAMERA_HEIGHT
         cam_positions = np.stack([cam_x, cam_y, cam_z], axis=-1)  # (n_envs, 3)
 
-        look_dist = 1.0
+        look_dist = _CAMERA_LOOK_DIST
         looktats = np.stack([
             cam_x + look_dist * np.cos(headings),
             cam_y + look_dist * np.sin(headings),
-            cam_z - 0.1,
+            cam_z - _CAMERA_LOOKAT_DOWN,
         ], axis=-1)  # (n_envs, 3)
 
         up = np.zeros_like(cam_positions)
@@ -1470,7 +1477,7 @@ class BatchGenesisMemoryMazeEnv:
             positions[:, np.newaxis, :2] - self._target_positions[:, :, :2],
             axis=2,
         )
-        visible = self._target_positions[:, :, 2] > -5
+        visible = self._target_positions[:, :, 2] > _UNDERGROUND_THRESHOLD
         is_current = (np.arange(self._n_targets)[np.newaxis, :]
                       == self._current_target_ix[:, np.newaxis])
         hit = (dists < TARGET_ACTIVATION_GAP) & visible & is_current
@@ -1521,7 +1528,7 @@ class BatchGenesisMemoryMazeEnv:
 
         # Create maze once per env, then regenerate (matches MuJoCo lifecycle)
         if self._mazes[env_idx] is None:
-            seed = rng.randint(2147483648)
+            seed = rng.randint(_SEED_MAX)
             self._mazes[env_idx] = labmaze.RandomMaze(
                 height=self._scene.outer_size,
                 width=self._scene.outer_size,
@@ -1587,7 +1594,7 @@ class BatchGenesisMemoryMazeEnv:
         """Draw target color border on an image (in-place)."""
         color = TARGET_COLORS[target_ix]
         B = int(2 * math.sqrt(self._camera_resolution / 64))
-        border_color = (color * 255 * 0.7).astype(np.uint8)
+        border_color = (color * 255 * _BORDER_DIM_FACTOR).astype(np.uint8)
         img[:, :B] = border_color
         img[:, -B:] = border_color
         img[:B, :] = border_color
