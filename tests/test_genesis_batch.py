@@ -170,8 +170,8 @@ class TestPhantomCollisions:
             for wall in scene.wall_entities:
                 wall.set_pos(np.array([0.0, 0.0, -10.0]))
             if place_hidden:
-                # Place wall underground at the ball's XY
-                scene.wall_entities[0].set_pos(np.array([0.0, 0.0, -10.0]))
+                # Place wall underground at the ball's XY (same XY, deep underground)
+                scene.wall_entities[0].set_pos(np.array([0.0, 0.0, -0.75]))
             scene.walker.set_pos(np.array([0.0, 0.0, WALKER_RADIUS]))
             scene.walker.set_quat(np.array([1.0, 0.0, 0.0, 0.0]))
             scene.walker.set_dofs_velocity(np.zeros(6))
