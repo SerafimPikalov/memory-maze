@@ -701,22 +701,14 @@ class GenesisMazeScene(_BaseMazeScene):
                 objects_per_room=1,
                 random_seed=seed,
             )
-        self._maze.regenerate()
-        if self.use_textures:
-            _apply_block_variations(self._maze)
-            shuffled = self.shuffled_wall_groups(rng)
-        else:
-            shuffled = None
-
-        # Configure walls (one entity per maze wall cell, uniform size)
-        wall_segments = extract_wall_cells(self._maze, self.xy_scale, self.z_height)
-        self._configure_walls_for_env(0, wall_segments, wall_groups=shuffled)
+        wall_segments, wall_groups, spawn_positions, target_positions = \
+            _regenerate_maze(self._maze, rng, self.use_textures,
+                             self.xy_scale, self.z_height, self)
+        self._configure_walls_for_env(0, wall_segments, wall_groups=wall_groups)
 
         # Place walker at random spawn
-        spawn_positions = extract_positions(self._maze, 'P', self.xy_scale)
         if spawn_positions:
-            spawn_idx = rng.randint(len(spawn_positions))
-            spawn_pos = spawn_positions[spawn_idx]
+            spawn_pos = spawn_positions[rng.randint(len(spawn_positions))]
         else:
             spawn_pos = np.array([0.0, 0.0, 0.0])
 
@@ -728,7 +720,6 @@ class GenesisMazeScene(_BaseMazeScene):
         self.walker.set_dofs_velocity(np.zeros(6))
 
         # Place targets at random target positions
-        target_positions = extract_positions(self._maze, 'G', self.xy_scale)
         rng.shuffle(target_positions)
         self._target_world_positions = []
         for i in range(self.n_targets):
@@ -887,6 +878,31 @@ def _pick_new_target(rng, current_ix, target_positions, walker_pos,
     fallback = (current_ix + 1) % n_targets
     logging.warning("_pick_new_target: all targets within activation gap, using fallback")
     return fallback
+
+
+def _regenerate_maze(maze, rng, use_textures, xy_scale, z_height, wall_groups_source):
+    """Regenerate maze and extract layout data.
+
+    Shared by single-env and batch-env reset paths.
+
+    Returns
+    -------
+    wall_segments : list[WallSegment]
+    wall_groups : dict or None
+        Shuffled texture groups (None if use_textures=False).
+    spawn_positions : list[np.ndarray]
+    target_positions : list[np.ndarray]
+    """
+    maze.regenerate()
+    if use_textures:
+        _apply_block_variations(maze)
+        wall_groups = wall_groups_source.shuffled_wall_groups(rng)
+    else:
+        wall_groups = None
+    wall_segments = extract_wall_cells(maze, xy_scale, z_height)
+    spawn_positions = extract_positions(maze, 'P', xy_scale)
+    target_positions = extract_positions(maze, 'G', xy_scale)
+    return wall_segments, wall_groups, spawn_positions, target_positions
 
 
 def _draw_border(img, target_ix, camera_resolution):
@@ -1546,27 +1562,19 @@ class BatchGenesisMemoryMazeEnv:
                 height=self._scene.outer_size,
                 width=self._scene.outer_size,
                 max_rooms=self._max_rooms,
-                room_min_size=3,
+                room_min_size=self._scene.room_min_size,
                 room_max_size=self._room_max_size,
                 spawns_per_room=1,
                 objects_per_room=1,
                 random_seed=seed,
             )
         maze = self._mazes[env_idx]
-        maze.regenerate()
-        if self._scene.use_textures:
-            _apply_block_variations(maze)
-            # Shuffle texture-to-region mapping per env (doesn't mutate shared state)
-            shuffled = self._scene.shuffled_wall_groups(rng)
-        else:
-            shuffled = None
-
-        # Configure walls (one entity per maze wall cell, uniform size)
-        wall_segments = extract_wall_cells(maze, self._xy_scale, self._z_height)
-        self._scene.configure_walls_for_env(env_idx, wall_segments, wall_groups=shuffled)
+        wall_segments, wall_groups, spawn_positions, target_positions = \
+            _regenerate_maze(maze, rng, self._scene.use_textures,
+                             self._xy_scale, self._z_height, self._scene)
+        self._scene.configure_walls_for_env(env_idx, wall_segments, wall_groups=wall_groups)
 
         # Place walker
-        spawn_positions = extract_positions(maze, 'P', self._xy_scale)
         if spawn_positions:
             spawn_pos = spawn_positions[rng.randint(len(spawn_positions))]
         else:
@@ -1576,8 +1584,7 @@ class BatchGenesisMemoryMazeEnv:
         self._walker_headings[env_idx] = heading
         self._scene.set_walker_pose(env_idx, spawn_pos, heading)
 
-        # Place targets
-        target_positions = extract_positions(maze, 'G', self._xy_scale)
+        # Place targets (target_positions from _regenerate_maze above)
         rng.shuffle(target_positions)
         target_z = TARGET_RADIUS + self._target_height
         for t in range(self._n_targets):
