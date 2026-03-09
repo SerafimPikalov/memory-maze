@@ -1689,19 +1689,15 @@ class TestRoomMinSizePropagation:
 
 
 class TestUnknownKwargsHandling:
-    """Document current behavior: unknown kwargs are silently swallowed."""
+    """Unknown kwargs should raise TypeError (no silent swallowing)."""
 
-    def test_unknown_kwargs_accepted_silently(self, _init_genesis):
-        """GenesisMemoryMazeEnv currently accepts unknown kwargs without error."""
-        # This documents the current (undesirable) behavior.
-        # After refactoring, this test should be updated to expect TypeError.
-        env = GenesisMemoryMazeEnv(
-            maze_size=9, camera_resolution=32, seed=42,
-            totally_bogus_param=True,
-        )
-        obs = env.reset()
-        assert obs.shape == (32, 32, 3)
-        env.close()
+    def test_unknown_kwargs_raises_type_error(self, _init_genesis):
+        """GenesisMemoryMazeEnv rejects unknown kwargs with TypeError."""
+        with pytest.raises(TypeError, match="totally_bogus_param"):
+            GenesisMemoryMazeEnv(
+                maze_size=9, camera_resolution=32, seed=42,
+                totally_bogus_param=True,
+            )
 
 
 class TestToNumpyConsistency:

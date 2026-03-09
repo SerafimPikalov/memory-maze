@@ -353,7 +353,8 @@ class _BaseMazeScene:
         n_envs=0,
         max_collision_pairs=None,
     ):
-        assert gs is not None, "Genesis is not installed. Install with: pip install genesis-world"
+        if gs is None:
+            raise ImportError("Genesis is not installed. Install with: pip install genesis-world")
 
         self._n_envs = n_envs
         self.maze_size = maze_size
@@ -528,6 +529,11 @@ class _BaseMazeScene:
 
         self._built = False
         _log.info("[%s] Cameras added. Scene __init__ complete, ready to build.", _elapsed())
+
+    @property
+    def n_envs(self):
+        """Number of parallel environments (0 for single-env mode)."""
+        return self._n_envs
 
     def _setup_camera(self):
         """Subclass hook: create camera(s) appropriate for the rendering mode."""
@@ -824,10 +830,7 @@ class GenesisMazeScene(_BaseMazeScene):
         """Render egocentric camera view. Returns uint8 numpy [H, W, 3]."""
         result = self.camera.render(rgb=True, depth=False, segmentation=False, force_render=True)
         # render() returns a tuple: (rgb, depth, segmentation, normal)
-        rgb = result[0]
-        if hasattr(rgb, 'cpu'):
-            rgb = rgb.cpu().numpy()
-        return np.asarray(rgb, dtype=np.uint8)
+        return np.asarray(_to_numpy(result[0]), dtype=np.uint8)
 
     def check_target_contacts(self, walker_pos):
         """Check which targets are within activation distance of walker.
@@ -907,11 +910,13 @@ class GenesisMemoryMazeEnv(gym.Env):
         physics_timestep=DEFAULT_PHYSICS_TIMESTEP,
         use_textures=True,
         use_batch_renderer=None,
-        **kwargs,
     ):
         super().__init__()
-        assert gs is not None, "Genesis not installed"
-        assert gym is not None, "gym not installed"
+        if gs is None:
+            raise ImportError("Genesis not installed. Install with: pip install genesis-world")
+        if gym is None:
+            raise ImportError("gym not installed. Install with: pip install 'gym>=0.21,<1.0'")
+
 
         # Look up defaults from maze config
         cfg = MAZE_CONFIGS.get(maze_size, (3, 250, 6, 5))
@@ -1111,8 +1116,8 @@ class BatchGenesisMazeScene(_BaseMazeScene):
         use_textures=True,
         texture_seed=None,
     ):
-        assert n_envs >= 1, "n_envs must be >= 1"
-        self.n_envs = n_envs
+        if n_envs < 1:
+            raise ValueError("n_envs must be >= 1")
         super().__init__(
             maze_size=maze_size, n_targets=n_targets, xy_scale=xy_scale,
             z_height=z_height, camera_resolution=camera_resolution,
@@ -1258,17 +1263,14 @@ class BatchGenesisMazeScene(_BaseMazeScene):
         if self.camera is not None:
             # BatchRenderer: one call returns (n_envs, H, W, 3) CUDA tensor
             rgb = self.camera.render(rgb=True, depth=False, segmentation=False, force_render=True)[0]
-            return rgb.cpu().numpy().astype(np.uint8)
+            return np.asarray(_to_numpy(rgb), dtype=np.uint8)
         else:
             # Rasterizer: sequential per-env loop
             res = self.camera_resolution
             images = np.empty((self.n_envs, res, res, 3), dtype=np.uint8)
             for i in range(self.n_envs):
                 result = self.cameras[i].render(rgb=True, depth=False, segmentation=False, force_render=True)
-                rgb = result[0]
-                if hasattr(rgb, 'cpu'):
-                    rgb = rgb.cpu().numpy()
-                images[i] = np.asarray(rgb, dtype=np.uint8)
+                images[i] = np.asarray(_to_numpy(result[0]), dtype=np.uint8)
             return images
 
     def render_single(self, env_idx):
@@ -1281,14 +1283,11 @@ class BatchGenesisMazeScene(_BaseMazeScene):
         if self.camera is not None:
             # BatchRenderer: render all, extract one
             rgb = self.camera.render(rgb=True, depth=False, segmentation=False, force_render=True)[0]
-            return rgb[env_idx].cpu().numpy().astype(np.uint8)
+            return np.asarray(_to_numpy(rgb[env_idx]), dtype=np.uint8)
         else:
             # Rasterizer: render specific camera
             result = self.cameras[env_idx].render(rgb=True, depth=False, segmentation=False, force_render=True)
-            rgb = result[0]
-            if hasattr(rgb, 'cpu'):
-                rgb = rgb.cpu().numpy()
-            return np.asarray(rgb, dtype=np.uint8)
+            return np.asarray(_to_numpy(result[0]), dtype=np.uint8)
 
     def reset_env(self, env_idx):
         """Reset a single environment to its build-time state.
@@ -1328,7 +1327,8 @@ class BatchGenesisMemoryMazeEnv:
         use_textures=True,
         physics_timestep=DEFAULT_PHYSICS_TIMESTEP,
     ):
-        assert gs is not None, "Genesis not installed"
+        if gs is None:
+            raise ImportError("Genesis not installed. Install with: pip install genesis-world")
 
         cfg = MAZE_CONFIGS.get(maze_size, (3, 250, 6, 5))
         n_targets = cfg[0]
