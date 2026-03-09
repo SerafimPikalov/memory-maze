@@ -1094,7 +1094,12 @@ class GenesisMemoryMazeEnv(gym.Env):
         raise ValueError(f"Unsupported render mode: {mode}")
 
     def close(self):
-        pass
+        """Release scene reference to allow garbage collection.
+
+        Genesis does not expose a public scene.destroy() API, so we drop
+        our reference and rely on GC.  Safe to call multiple times.
+        """
+        self._scene = None
 
 
 # ---------------------------------------------------------------------------
@@ -1609,8 +1614,13 @@ class BatchGenesisMemoryMazeEnv:
         _draw_border(img, target_ix, self._camera_resolution)
 
     def close(self):
-        """Clean up resources."""
-        pass
+        """Release scene and maze references to allow garbage collection.
+
+        Genesis does not expose a public scene.destroy() API, so we drop
+        our references and rely on GC.  Safe to call multiple times.
+        """
+        self._scene = None
+        self._mazes = None
 
 
 # ---------------------------------------------------------------------------

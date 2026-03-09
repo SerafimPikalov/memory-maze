@@ -1536,36 +1536,28 @@ class TestPickNewTargetDegenerate:
 # Pre-refactoring behavior locks
 # ===================================================================
 
-class TestCloseIdempotent:
-    """Lock in that close() is safe to call multiple times and env is
-    usable up until close (current behavior: close is a no-op)."""
+class TestCloseReleasesResources:
+    """Verify close() releases the scene and is safe to call multiple times."""
 
-    def test_single_env_close_is_noop(self, _init_genesis):
-        """Single-env close() does not break subsequent reset/step."""
+    def test_single_env_close_releases_scene(self, _init_genesis):
+        """Single-env close() sets _scene to None."""
         env = GenesisMemoryMazeEnv(maze_size=9, camera_resolution=32, seed=42)
         env.reset()
         env.step(1)
+        assert env._scene is not None
         env.close()
-        # Currently close() is a no-op, so env still works
-        obs = env.reset()
-        assert obs.shape == (32, 32, 3)
-        env.close()
+        assert env._scene is None
 
-    @pytest.mark.skipif(
-        sys.platform == "darwin",
-        reason="Batch env rendering requires OpenGL 4.2 (not available on macOS)",
-    )
-    def test_batch_env_close_is_noop(self, _init_genesis):
-        """Batch-env close() does not break subsequent reset/step."""
+    def test_batch_env_close_releases_scene(self, _init_genesis):
+        """Batch-env close() sets _scene and _mazes to None."""
         env = BatchGenesisMemoryMazeEnv(
-            n_envs=2, maze_size=9, seed=42, camera_resolution=32,
+            n_envs=1, maze_size=9, seed=42, camera_resolution=32,
         )
         env.reset()
-        env.step([0, 1])
+        assert env._scene is not None
         env.close()
-        obs = env.reset()
-        assert obs.shape == (2, 32, 32, 3)
-        env.close()
+        assert env._scene is None
+        assert env._mazes is None
 
     def test_double_close_safe(self, _init_genesis):
         """Calling close() twice should not raise."""
