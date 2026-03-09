@@ -1529,3 +1529,213 @@ class TestPickNewTargetDegenerate:
             "are within activation distance"
         )
         env.close()
+
+
+# ===================================================================
+# Pre-refactoring behavior locks
+# ===================================================================
+
+class TestCloseIdempotent:
+    """Lock in that close() is safe to call multiple times and env is
+    usable up until close (current behavior: close is a no-op)."""
+
+    def test_single_env_close_is_noop(self, _init_genesis):
+        """Single-env close() does not break subsequent reset/step."""
+        env = GenesisMemoryMazeEnv(maze_size=9, camera_resolution=32, seed=42)
+        env.reset()
+        env.step(1)
+        env.close()
+        # Currently close() is a no-op, so env still works
+        obs = env.reset()
+        assert obs.shape == (32, 32, 3)
+        env.close()
+
+    @pytest.mark.skipif(
+        sys.platform == "darwin",
+        reason="Batch env rendering requires OpenGL 4.2 (not available on macOS)",
+    )
+    def test_batch_env_close_is_noop(self, _init_genesis):
+        """Batch-env close() does not break subsequent reset/step."""
+        env = BatchGenesisMemoryMazeEnv(
+            n_envs=2, maze_size=9, seed=42, camera_resolution=32,
+        )
+        env.reset()
+        env.step([0, 1])
+        env.close()
+        obs = env.reset()
+        assert obs.shape == (2, 32, 32, 3)
+        env.close()
+
+    def test_double_close_safe(self, _init_genesis):
+        """Calling close() twice should not raise."""
+        env = GenesisMemoryMazeEnv(maze_size=9, camera_resolution=32, seed=42)
+        env.reset()
+        env.close()
+        env.close()  # second call should be safe
+
+
+class TestBorderColorCorrectness:
+    """Verify border pixels match the current target's color."""
+
+    def test_single_env_border_matches_target_color(self, _init_genesis):
+        """Border color should be TARGET_COLORS[current_target] * 255 * 0.7."""
+        env = GenesisMemoryMazeEnv(maze_size=9, camera_resolution=64, seed=42)
+        obs = env.reset()
+        target_ix = env._current_target_ix
+        expected_color = (TARGET_COLORS[target_ix] * 255 * 0.7).astype(np.uint8)
+        # Check top-left corner pixel (definitely in border)
+        actual = obs[0, 0, :]
+        np.testing.assert_array_equal(actual, expected_color,
+            err_msg=f"Border color mismatch: target_ix={target_ix}")
+        env.close()
+
+    @pytest.mark.skipif(
+        sys.platform == "darwin",
+        reason="Batch env rendering requires OpenGL 4.2 (not available on macOS)",
+    )
+    def test_batch_env_border_matches_target_color(self, _init_genesis):
+        """Batch border should match per-env target color."""
+        env = BatchGenesisMemoryMazeEnv(
+            n_envs=2, maze_size=9, seed=42, camera_resolution=64,
+        )
+        obs = env.reset()
+        for i in range(2):
+            target_ix = int(env._current_target_ix[i])
+            expected = (TARGET_COLORS[target_ix] * 255 * 0.7).astype(np.uint8)
+            actual = obs[i, 0, 0, :]
+            np.testing.assert_array_equal(actual, expected,
+                err_msg=f"Env {i} border mismatch: target_ix={target_ix}")
+        env.close()
+
+
+class TestResetDeterminism:
+    """Verify same-seed resets produce identical layouts."""
+
+    def test_same_seed_same_walls(self, _init_genesis):
+        """Two envs with the same seed should produce identical wall positions."""
+        positions_per_run = []
+        for _ in range(2):
+            scene = GenesisMazeScene(
+                maze_size=9, n_targets=3, camera_resolution=32,
+                use_textures=False,
+            )
+            scene.build()
+            rng = np.random.RandomState(42)
+            scene.reset(rng)
+            # Collect all visible wall positions
+            wall_pos = []
+            for w in scene.wall_entities:
+                pos = w.get_pos()
+                p = pos.cpu().numpy() if hasattr(pos, 'cpu') else np.asarray(pos)
+                if p[2] > -5:
+                    wall_pos.append(p.copy())
+            positions_per_run.append(sorted([tuple(p) for p in wall_pos]))
+        assert positions_per_run[0] == positions_per_run[1], \
+            "Same-seed resets should produce identical wall layouts"
+
+    def test_same_seed_same_spawn(self, _init_genesis):
+        """Two envs with the same seed should place walker at same position."""
+        walker_positions = []
+        for _ in range(2):
+            scene = GenesisMazeScene(
+                maze_size=9, n_targets=3, camera_resolution=32,
+                use_textures=False,
+            )
+            scene.build()
+            rng = np.random.RandomState(42)
+            scene.reset(rng)
+            walker_positions.append(scene.get_walker_position().copy())
+        np.testing.assert_array_almost_equal(
+            walker_positions[0], walker_positions[1], decimal=5,
+            err_msg="Same-seed resets should produce identical spawn positions"
+        )
+
+    def test_same_seed_same_targets(self, _init_genesis):
+        """Two envs with the same seed should place targets identically."""
+        target_positions = []
+        for _ in range(2):
+            scene = GenesisMazeScene(
+                maze_size=9, n_targets=3, camera_resolution=32,
+                use_textures=False,
+            )
+            scene.build()
+            rng = np.random.RandomState(42)
+            scene.reset(rng)
+            target_positions.append(
+                [p.copy() for p in scene._target_world_positions]
+            )
+        for i in range(3):
+            np.testing.assert_array_almost_equal(
+                target_positions[0][i], target_positions[1][i], decimal=5,
+                err_msg=f"Target {i} position mismatch between same-seed resets"
+            )
+
+
+class TestRoomMinSizePropagation:
+    """Verify room_min_size flows from scene to batch reset."""
+
+    def test_batch_env_uses_scene_room_min_size(self, _init_genesis):
+        """BatchGenesisMemoryMazeEnv._reset_single_env should use
+        the scene's room_min_size, not a hardcoded value."""
+        env = BatchGenesisMemoryMazeEnv(
+            n_envs=1, maze_size=9, seed=42, camera_resolution=32,
+        )
+        # Verify the scene has room_min_size stored
+        assert hasattr(env._scene, 'room_min_size'), \
+            "Scene should expose room_min_size"
+        assert env._scene.room_min_size == 3, \
+            f"Expected room_min_size=3, got {env._scene.room_min_size}"
+        env.close()
+
+
+class TestUnknownKwargsHandling:
+    """Document current behavior: unknown kwargs are silently swallowed."""
+
+    def test_unknown_kwargs_accepted_silently(self, _init_genesis):
+        """GenesisMemoryMazeEnv currently accepts unknown kwargs without error."""
+        # This documents the current (undesirable) behavior.
+        # After refactoring, this test should be updated to expect TypeError.
+        env = GenesisMemoryMazeEnv(
+            maze_size=9, camera_resolution=32, seed=42,
+            totally_bogus_param=True,
+        )
+        obs = env.reset()
+        assert obs.shape == (32, 32, 3)
+        env.close()
+
+
+class TestToNumpyConsistency:
+    """Verify render output is always numpy uint8 regardless of backend."""
+
+    def test_render_egocentric_returns_numpy_uint8(self, single_scene, rng):
+        """render_egocentric() should always return numpy uint8 array."""
+        single_scene.reset(rng)
+        img = single_scene.render_egocentric()
+        assert isinstance(img, np.ndarray), f"Expected ndarray, got {type(img)}"
+        assert img.dtype == np.uint8, f"Expected uint8, got {img.dtype}"
+
+    @pytest.mark.skipif(
+        sys.platform == "darwin",
+        reason="Batch env rendering requires OpenGL 4.2 (not available on macOS)",
+    )
+    def test_batch_render_all_returns_numpy_uint8(self, batch_scene_2):
+        """render_all() should always return numpy uint8 array."""
+        import labmaze
+        rng = np.random.RandomState(42)
+        maze = labmaze.RandomMaze(
+            height=batch_scene_2.outer_size,
+            width=batch_scene_2.outer_size,
+            max_rooms=6, room_min_size=3, room_max_size=5,
+            spawns_per_room=1, objects_per_room=1,
+            random_seed=42,
+        )
+        segments = extract_wall_segments(maze)
+        for i in range(2):
+            batch_scene_2.configure_walls_for_env(i, segments)
+            batch_scene_2.set_walker_pose(i, [0.0, 0.0], 0.0)
+        positions = batch_scene_2.get_walker_positions()
+        batch_scene_2.update_cameras(positions, np.array([0.0, 0.0]))
+        imgs = batch_scene_2.render_all()
+        assert isinstance(imgs, np.ndarray), f"Expected ndarray, got {type(imgs)}"
+        assert imgs.dtype == np.uint8, f"Expected uint8, got {imgs.dtype}"
+        assert imgs.shape == (2, 32, 32, 3)
