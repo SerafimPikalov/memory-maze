@@ -1621,6 +1621,10 @@ class BatchGenesisMemoryMazeEnv:
     def n_envs(self):
         return self._n_envs
 
+    @property
+    def action_space(self):
+        return spaces.Discrete(6)
+
     def reset(self):
         """Reset all environments. Returns observations (n_envs, H, W, 3)."""
         for i in range(self._n_envs):
