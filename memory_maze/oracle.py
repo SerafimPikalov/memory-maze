@@ -75,6 +75,97 @@ class DrawMinimapWrapper(ObservationWrapper):
         return obs
 
 
+def _draw_minimap_on_obs(obs):
+    """Draw minimap overlay on obs['image'] in-place. Standalone function.
+
+    Extracted from DrawMinimapWrapper for use by both dm_env and gym wrappers.
+    """
+    from PIL import Image
+
+    maze = obs['maze_layout']
+    x, y = obs['agent_pos']
+    dx, dy = obs['agent_dir']
+    angle = np.arctan2(dx, dy)
+    N = maze.shape[0]
+    SIZE = N * 2
+
+    # Draw map
+    map_img = np.zeros((N, N, 3), np.uint8)
+    map_img[:, :] += (maze == 1)[..., None] * np.array([[[255, 255, 255]]], np.uint8)
+    map_img[:, :] += (maze == 2)[..., None] * np.array([[[0, 255, 0]]], np.uint8)
+    map_img[int(y), int(x)] = np.array([255, 0, 0], np.uint8)
+    map_img = np.flip(map_img, 0)
+
+    # Scale, rotate, translate
+    mapimg = Image.fromarray(map_img)
+    mapimg = mapimg.resize((SIZE, SIZE), resample=0)
+    tx = (x - N / 2) / N * SIZE
+    ty = -(y - N / 2) / N * SIZE
+    mapimg = mapimg.transform(mapimg.size, 0,
+                              (1, 0, tx,
+                               0, 1, ty),
+                              resample=0)
+    mapimg = mapimg.rotate(angle / np.pi * 180, resample=0)
+
+    # Overlay minimap onto image top-right corner
+    img = obs['image']
+    img[:SIZE, -SIZE:] = img[:SIZE, -SIZE:] // 2 + np.array(mapimg) // 2
+
+
+# ---------------------------------------------------------------------------
+# Gym wrappers for Genesis backend Oracle support
+# ---------------------------------------------------------------------------
+
+try:
+    import gym as _gym
+
+    class GymPathOverlayWrapper(_gym.Wrapper):
+        """Gym wrapper: BFS shortest path + minimap overlay on dict obs.
+
+        Expects obs dict with: image, agent_pos, agent_dir, target_pos, maze_layout.
+        Modifies maze_layout (path=2) and overlays minimap on image.
+        """
+
+        def step(self, action):
+            obs, reward, done, info = self.env.step(action)
+            return self._add_overlay(obs), reward, done, info
+
+        def reset(self, **kwargs):
+            obs = self.env.reset(**kwargs)
+            return self._add_overlay(obs)
+
+        def _add_overlay(self, obs):
+            maze = obs['maze_layout'].copy()
+            start = tuple(obs['agent_pos'].astype(int))
+            finish = tuple(obs['target_pos'].astype(int))
+            path = breadth_first_search(maze, start, finish)
+            if path:
+                for x, y in path:
+                    maze[y, x] = 2
+            obs['maze_layout'] = maze
+            _draw_minimap_on_obs(obs)
+            return obs
+
+    class GymImageOnlyWrapper(_gym.Wrapper):
+        """Gym wrapper: extract image from dict observation."""
+
+        def __init__(self, env, key='image'):
+            super().__init__(env)
+            self.key = key
+            self.observation_space = env.observation_space[key]
+
+        def step(self, action):
+            obs, reward, done, info = self.env.step(action)
+            return obs[self.key], reward, done, info
+
+        def reset(self, **kwargs):
+            obs = self.env.reset(**kwargs)
+            return obs[self.key]
+
+except ImportError:
+    pass
+
+
 def breadth_first_search(maze: np.ndarray, start: Tuple[int, int], finish: Tuple[int, int]) -> Optional[List[Tuple[int, int]]]:
     h, w = maze.shape
 
