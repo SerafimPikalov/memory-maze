@@ -106,6 +106,10 @@ TARGET_ACTIVATION_GAP = WALKER_RADIUS + TARGET_RADIUS  # 0.8m center-to-center, 
 # so they appear brighter than flat walls. Scale down to compensate.
 TARGET_COLOR_SCALE = 0.5
 
+# Top-down camera — ear entities for walker visibility
+EAR_RADIUS = 0.26
+EAR_OFFSET = 0.22
+
 # Timing
 DEFAULT_CONTROL_FREQ = 4.0
 DEFAULT_PHYSICS_TIMESTEP = 0.005
@@ -359,6 +363,8 @@ class _BaseMazeScene:
         texture_seed=None,
         n_envs=0,
         max_collision_pairs=None,
+        top_camera=False,
+        randomize_colors=False,
     ):
         if gs is None:
             raise ImportError("Genesis is not installed. Install with: pip install genesis-world")
@@ -376,6 +382,8 @@ class _BaseMazeScene:
         self.room_max_size = room_max_size
         self.target_height_above_ground = target_height_above_ground
         self.use_textures = use_textures
+        self._top_camera = top_camera
+        self._randomize_colors = randomize_colors
 
         self.n_substeps = max(1, int(round(control_timestep / physics_timestep)))
         self.outer_size = maze_size + 2
@@ -513,9 +521,11 @@ class _BaseMazeScene:
         _log.info("[%s] Walker entity added", _elapsed())
 
         # --- Targets (non-colliding colored spheres) ---
+        # 6CL mode: pre-allocate all 6 colored spheres (show/hide at reset)
+        n_target_entities = 6 if randomize_colors else n_targets
         self.target_entities = []
         self.target_colors = list(TARGET_COLORS)
-        for i in range(n_targets):
+        for i in range(n_target_entities):
             color = self.target_colors[i]
             target = self.scene.add_entity(
                 morph=gs.morphs.Sphere(
@@ -529,7 +539,31 @@ class _BaseMazeScene:
                 ),
             )
             self.target_entities.append(target)
-        _log.info("[%s] %d target entities added", _elapsed(), n_targets)
+        _log.info("[%s] %d target entities added", _elapsed(), n_target_entities)
+
+        # --- Ear entities (for top-down camera walker visibility) ---
+        self.ear_right = None
+        self.ear_left = None
+        if top_camera:
+            self.ear_right = self.scene.add_entity(
+                morph=gs.morphs.Sphere(
+                    pos=(0, 0, HIDDEN_Z),
+                    radius=EAR_RADIUS,
+                    fixed=True,
+                    collision=False,
+                ),
+                surface=gs.surfaces.Default(color=(1.0, 0.0, 0.0, 1.0)),  # red = right
+            )
+            self.ear_left = self.scene.add_entity(
+                morph=gs.morphs.Sphere(
+                    pos=(0, 0, HIDDEN_Z),
+                    radius=EAR_RADIUS,
+                    fixed=True,
+                    collision=False,
+                ),
+                surface=gs.surfaces.Default(color=(0.0, 0.0, 1.0, 1.0)),  # blue = left
+            )
+            _log.info("[%s] Ear entities added for top camera", _elapsed())
 
         # --- Camera (subclass hook) ---
         self._setup_camera()
@@ -657,6 +691,8 @@ class GenesisMazeScene(_BaseMazeScene):
         target_height_above_ground=-0.6,
         use_textures=True,
         texture_seed=None,
+        top_camera=False,
+        randomize_colors=False,
     ):
         super().__init__(
             maze_size=maze_size, n_targets=n_targets, xy_scale=xy_scale,
@@ -667,6 +703,7 @@ class GenesisMazeScene(_BaseMazeScene):
             target_height_above_ground=target_height_above_ground,
             use_textures=use_textures, texture_seed=texture_seed,
             n_envs=0,
+            top_camera=top_camera, randomize_colors=randomize_colors,
         )
         # State tracking (single-env specific)
         self._maze = None
@@ -674,7 +711,7 @@ class GenesisMazeScene(_BaseMazeScene):
         self._walker_heading = 0.0
 
     def _setup_camera(self):
-        """Single-env: one camera, no env_idx."""
+        """Single-env: egocentric camera + optional top-down camera."""
         self.camera = self.scene.add_camera(
             res=(self.camera_resolution, self.camera_resolution),
             pos=(0, 0, WALKER_CAMERA_HEIGHT + WALKER_RADIUS),
@@ -683,6 +720,19 @@ class GenesisMazeScene(_BaseMazeScene):
             near=0.05,
             far=50.0,
         )
+        self.top_cam = None
+        if self._top_camera:
+            maze_extent = self.outer_size * self.xy_scale
+            top_fov = (360.0 / math.pi) * math.atan2(1.1 * maze_extent / 2, 100.0)
+            self.top_cam = self.scene.add_camera(
+                res=(self.camera_resolution, self.camera_resolution),
+                pos=(0, 0, 100),
+                lookat=(0, 0, 0),
+                fov=top_fov,
+                near=0.5,
+                far=200.0,
+                up=(0, 1, 0),
+            )
 
     def reset(self, rng):
         """Reset the scene: regenerate maze, place walker and targets."""
@@ -789,6 +839,7 @@ class GenesisMazeScene(_BaseMazeScene):
         omega_z = float(v[5])
         self._walker_heading -= omega_z * self.control_timestep
         self._update_camera()
+        self._update_ears()
 
     def _get_walker_heading(self):
         """Get walker heading from tracked state.
@@ -820,6 +871,26 @@ class GenesisMazeScene(_BaseMazeScene):
         ])
         self.camera.set_pose(pos=cam_pos, lookat=lookat, up=(0, 0, 1))
 
+    def _update_ears(self):
+        """Update ear entity positions to track walker (for top-down camera)."""
+        if self.ear_right is None:
+            return
+        wpos = _to_numpy(self.walker.get_pos())
+        h = self._walker_heading
+        cos_h, sin_h = math.cos(h), math.sin(h)
+        # Right ear: perpendicular right from forward direction
+        self.ear_right.set_pos(np.array([
+            wpos[0] + EAR_OFFSET * sin_h,
+            wpos[1] - EAR_OFFSET * cos_h,
+            wpos[2],
+        ], dtype=np.float32))
+        # Left ear: perpendicular left
+        self.ear_left.set_pos(np.array([
+            wpos[0] - EAR_OFFSET * sin_h,
+            wpos[1] + EAR_OFFSET * cos_h,
+            wpos[2],
+        ], dtype=np.float32))
+
     def get_walker_position(self):
         """Get walker [x, y, z] position as numpy array."""
         return _to_numpy(self.walker.get_pos())
@@ -828,6 +899,12 @@ class GenesisMazeScene(_BaseMazeScene):
         """Render egocentric camera view. Returns uint8 numpy [H, W, 3]."""
         result = self.camera.render(rgb=True, depth=False, segmentation=False, force_render=True)
         # render() returns a tuple: (rgb, depth, segmentation, normal)
+        return np.asarray(_to_numpy(result[0]), dtype=np.uint8)
+
+    def render_top(self):
+        """Render top-down camera view. Returns uint8 numpy [H, W, 3]."""
+        assert self.top_cam is not None, "Top camera not enabled"
+        result = self.top_cam.render(rgb=True, depth=False, segmentation=False, force_render=True)
         return np.asarray(_to_numpy(result[0]), dtype=np.uint8)
 
     def check_target_contacts(self, walker_pos):
@@ -948,13 +1025,15 @@ class GenesisMemoryMazeEnv(gym.Env):
         physics_timestep=DEFAULT_PHYSICS_TIMESTEP,
         use_textures=True,
         use_batch_renderer=None,
+        global_observables=False,
+        top_camera=False,
+        randomize_colors=False,
     ):
         super().__init__()
         if gs is None:
             raise ImportError("Genesis not installed. Install with: pip install genesis-world")
         if gym is None:
             raise ImportError("gym not installed. Install with: pip install 'gym>=0.21,<1.0'")
-
 
         # Look up defaults from maze config
         cfg = MAZE_CONFIGS.get(maze_size, (3, 250, 6, 5))
@@ -970,6 +1049,9 @@ class GenesisMemoryMazeEnv(gym.Env):
         self._time_limit = time_limit
         self._camera_resolution = camera_resolution
         self._control_freq = control_freq
+        self._global_observables = global_observables
+        self._top_camera = top_camera
+        self._randomize_colors = randomize_colors
         control_timestep = 1.0 / control_freq
         z_height = 0.4 if good_visibility else 1.5
         target_height = 0.5 if good_visibility else -0.6
@@ -979,20 +1061,30 @@ class GenesisMemoryMazeEnv(gym.Env):
 
         # Gym spaces
         self.action_space = spaces.Discrete(6)
-        self.observation_space = spaces.Box(
-            low=0, high=255,
-            shape=(camera_resolution, camera_resolution, 3),
-            dtype=np.uint8,
-        )
+        if global_observables:
+            self.observation_space = spaces.Dict({
+                'image': spaces.Box(0, 255, (camera_resolution, camera_resolution, 3), np.uint8),
+                'target_color': spaces.Box(0, 1, (3,), np.float64),
+                'agent_pos': spaces.Box(-np.inf, np.inf, (2,), np.float64),
+                'agent_dir': spaces.Box(-np.inf, np.inf, (2,), np.float64),
+                'targets_vec': spaces.Box(-np.inf, np.inf, (n_targets, 2), np.float64),
+                'targets_pos': spaces.Box(-np.inf, np.inf, (n_targets, 2), np.float64),
+                'target_vec': spaces.Box(-np.inf, np.inf, (2,), np.float64),
+                'target_pos': spaces.Box(-np.inf, np.inf, (2,), np.float64),
+                'maze_layout': spaces.Box(0, 1, (maze_size, maze_size), np.uint8),
+            })
+        else:
+            self.observation_space = spaces.Box(
+                low=0, high=255,
+                shape=(camera_resolution, camera_resolution, 3),
+                dtype=np.uint8,
+            )
 
         # RNG
         self._seed = seed
         self._rng = np.random.RandomState(seed)
 
         # Initialize Genesis (skip if already initialized).
-        # Default: CPU backend (safe for forked actor subprocesses).
-        # use_batch_renderer=True requires CUDA — caller must ensure
-        # gs.init(backend=gs.cuda) was called before constructing this env.
         if not gs._initialized:
             if use_batch_renderer:
                 gs.init(backend=gs.cuda, logging_level='warning')
@@ -1012,6 +1104,8 @@ class GenesisMemoryMazeEnv(gym.Env):
             target_height_above_ground=target_height,
             use_textures=use_textures,
             texture_seed=seed,
+            top_camera=top_camera,
+            randomize_colors=randomize_colors,
         )
         self._scene.build()
 
@@ -1020,7 +1114,13 @@ class GenesisMemoryMazeEnv(gym.Env):
         self._current_target_ix = 0
         self._targets_obtained = 0
         self._target_colors = list(TARGET_COLORS)
-        self._target_world_positions = []  # Stored for re-showing after collection
+        self._target_world_positions = []
+
+        # 6CL: entity-to-slot mapping (slot → entity index)
+        self._entity_for_slot = list(range(n_targets))
+
+        # Cached maze layout for ExtraObs (set on each reset)
+        self._cached_maze_layout = None
 
     def seed(self, seed=None):
         self._seed = seed
@@ -1037,6 +1137,28 @@ class GenesisMemoryMazeEnv(gym.Env):
         self._target_world_positions = [
             pos.copy() for pos in self._scene._target_world_positions
         ]
+
+        # 6CL: shuffle color-to-slot mapping and re-place target entities
+        if self._randomize_colors:
+            perm = list(range(6))
+            self._rng.shuffle(perm)
+            self._entity_for_slot = perm[:self._n_targets]
+            # Hide all 6 entity spheres
+            for i in range(6):
+                self._scene._hide_target(0, i)
+            # Show selected entities at target positions
+            for slot in range(self._n_targets):
+                entity_idx = self._entity_for_slot[slot]
+                self._scene._show_target(0, entity_idx, self._target_world_positions[slot])
+        else:
+            self._entity_for_slot = list(range(self._n_targets))
+
+        # Cache maze layout for ExtraObs
+        if self._global_observables:
+            self._cached_maze_layout = self._compute_maze_layout()
+
+        # Update ears to initial walker position
+        self._scene._update_ears()
 
         # Pick initial target
         self._current_target_ix = self._rng.randint(self._n_targets)
@@ -1087,20 +1209,78 @@ class GenesisMemoryMazeEnv(gym.Env):
         )
 
     def _render_obs(self):
-        """Render egocentric view with target color border."""
-        img = self._scene.render_egocentric()
+        """Render observation — image (flat) or dict (ExtraObs)."""
+        # Choose camera
+        if self._top_camera:
+            img = self._scene.render_top()
+        else:
+            img = self._scene.render_egocentric()
 
         # Ensure correct resolution
         if img.shape[0] != self._camera_resolution or img.shape[1] != self._camera_resolution:
-            # Resize if needed (shouldn't happen normally)
             from PIL import Image
             pil_img = Image.fromarray(img)
             pil_img = pil_img.resize((self._camera_resolution, self._camera_resolution))
             img = np.array(pil_img)
 
-        # Draw target color border (same as TargetColorAsBorderWrapper)
-        _draw_border(img, self._current_target_ix, self._camera_resolution)
+        # Color index for border and target_color (handles 6CL mapping)
+        color_ix = self._entity_for_slot[self._current_target_ix]
+        _draw_border(img, color_ix, self._camera_resolution)
+
+        if self._global_observables:
+            return self._compute_extra_obs(img, color_ix)
         return img
+
+    def _compute_extra_obs(self, img, color_ix):
+        """Compute dict observation with all ExtraObs keys."""
+        walker_pos_world = self._scene.get_walker_position()
+        heading = self._scene._get_walker_heading()
+        xy_scale = self._scene.xy_scale
+        outer_size = self._scene.outer_size
+        center_ji = np.array([outer_size - 2, outer_size - 2], dtype=np.float64) / 2.0
+
+        # agent_pos: grid coordinates
+        agent_pos = np.array(walker_pos_world[:2], dtype=np.float64) / xy_scale + center_ji
+
+        # agent_dir: forward direction unit vector
+        agent_dir = np.array([math.cos(heading), math.sin(heading)], dtype=np.float64)
+
+        # targets_pos (grid coords) and targets_vec (egocentric)
+        n = self._n_targets
+        targets_pos = np.zeros((n, 2), dtype=np.float64)
+        targets_vec = np.zeros((n, 2), dtype=np.float64)
+        cos_h = math.cos(heading)
+        sin_h = math.sin(heading)
+        for i in range(n):
+            tpos = self._target_world_positions[i]
+            targets_pos[i] = np.array(tpos[:2], dtype=np.float64) / xy_scale + center_ji
+            # Egocentric: rotate (target - walker) by -heading into walker frame
+            delta = (np.array(tpos[:2], dtype=np.float64) - np.array(walker_pos_world[:2], dtype=np.float64)) / xy_scale
+            targets_vec[i, 0] = delta[0] * cos_h + delta[1] * sin_h
+            targets_vec[i, 1] = -delta[0] * sin_h + delta[1] * cos_h
+
+        ix = self._current_target_ix
+        target_color = np.array(TARGET_COLORS[color_ix], dtype=np.float64)
+
+        return {
+            'image': img,
+            'target_color': target_color,
+            'agent_pos': agent_pos,
+            'agent_dir': agent_dir,
+            'targets_vec': targets_vec,
+            'targets_pos': targets_pos,
+            'target_vec': targets_vec[ix].copy(),
+            'target_pos': targets_pos[ix].copy(),
+            'maze_layout': self._cached_maze_layout.copy(),
+        }
+
+    def _compute_maze_layout(self):
+        """Compute binary maze layout from scene maze data."""
+        entity_layer = self._scene._maze.entity_layer
+        inner = entity_layer[1:-1, 1:-1]
+        inner = np.flip(inner, 0)
+        nonwalls = (inner == ' ') | (inner == 'P') | (inner == 'G')
+        return nonwalls.astype(np.uint8)
 
     def render(self, mode='rgb_array'):
         if mode == 'rgb_array':
@@ -1636,13 +1816,32 @@ class BatchGenesisMemoryMazeEnv:
 # Gym environment registration helper
 # ---------------------------------------------------------------------------
 
+def _make_oracle_imageonly_env(**kwargs):
+    """Factory: GenesisMemoryMazeEnv + BFS path overlay → image-only output."""
+    from memory_maze.oracle import GymPathOverlayWrapper, GymImageOnlyWrapper
+    env = GenesisMemoryMazeEnv(global_observables=True, **kwargs)
+    return GymImageOnlyWrapper(GymPathOverlayWrapper(env))
+
+
+def _make_oracle_extraobs_env(**kwargs):
+    """Factory: GenesisMemoryMazeEnv + BFS path overlay → dict output."""
+    from memory_maze.oracle import GymPathOverlayWrapper
+    env = GenesisMemoryMazeEnv(global_observables=True, **kwargs)
+    return GymPathOverlayWrapper(env)
+
+
 def register_genesis_envs():
-    """Register Genesis-backed Memory Maze environments with gym."""
+    """Register Genesis-backed Memory Maze environments with gym.
+
+    Naming convention: MemoryMaze-{size}-{Variant}-Genesis-v0
+    This matches train_impala.py auto-routing: env_id.replace("-v0", "-Genesis-v0")
+    """
     if gym is None:
         return
 
-    from functools import partial
     from gym.envs.registration import register
+
+    _EP = 'memory_maze.genesis_backend:GenesisMemoryMazeEnv'
 
     for key, (maze_size, (n_targets, time_limit, _, _)) in {
         '9x9': (9, MAZE_CONFIGS[9]),
@@ -1650,8 +1849,56 @@ def register_genesis_envs():
         '13x13': (13, MAZE_CONFIGS[13]),
         '15x15': (15, MAZE_CONFIGS[15]),
     }.items():
+        base = dict(maze_size=maze_size, n_targets=n_targets, time_limit=time_limit)
+
+        # --- Image-only variants (flat obs) ---
+        variants = [
+            ('',           dict()),
+            ('-Vis',       dict(good_visibility=True)),
+            ('-HD',        dict(camera_resolution=256)),
+            ('-HiFreq',    dict(control_freq=40)),
+            ('-HiFreq-Vis', dict(control_freq=40, good_visibility=True)),
+            ('-HiFreq-HD', dict(control_freq=40, camera_resolution=256)),
+            ('-6CL',       dict(randomize_colors=True)),
+            ('-Top',       dict(top_camera=True, camera_resolution=256)),
+            ('-6CL-Top',   dict(randomize_colors=True, top_camera=True, camera_resolution=256)),
+        ]
+        for suffix, extra_kwargs in variants:
+            register(
+                id=f'MemoryMaze-{key}{suffix}-Genesis-v0',
+                entry_point=_EP,
+                kwargs={**base, **extra_kwargs},
+            )
+
+        # --- ExtraObs variants (dict obs) ---
+        extraobs_variants = [
+            ('-ExtraObs',      dict()),
+            ('-ExtraObs-Vis',  dict(good_visibility=True)),
+            ('-6CL-ExtraObs',  dict(randomize_colors=True)),
+            ('-ExtraObs-Top',  dict(top_camera=True, camera_resolution=256)),
+        ]
+        for suffix, extra_kwargs in extraobs_variants:
+            register(
+                id=f'MemoryMaze-{key}{suffix}-Genesis-v0',
+                entry_point=_EP,
+                kwargs={**base, **extra_kwargs, 'global_observables': True},
+            )
+
+        # --- Oracle variants (need wrapper factories) ---
+        # Oracle image-only
         register(
-            id=f'MemoryMaze-{key}-Genesis-v0',
-            entry_point='memory_maze.genesis_backend:GenesisMemoryMazeEnv',
-            kwargs=dict(maze_size=maze_size, n_targets=n_targets, time_limit=time_limit),
+            id=f'MemoryMaze-{key}-Oracle-Genesis-v0',
+            entry_point='memory_maze.genesis_backend:_make_oracle_imageonly_env',
+            kwargs=base,
+        )
+        register(
+            id=f'MemoryMaze-{key}-Oracle-Top-Genesis-v0',
+            entry_point='memory_maze.genesis_backend:_make_oracle_imageonly_env',
+            kwargs={**base, 'top_camera': True, 'camera_resolution': 256},
+        )
+        # Oracle ExtraObs (dict obs with overlay)
+        register(
+            id=f'MemoryMaze-{key}-Oracle-ExtraObs-Genesis-v0',
+            entry_point='memory_maze.genesis_backend:_make_oracle_extraobs_env',
+            kwargs=base,
         )
