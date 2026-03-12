@@ -784,6 +784,38 @@ class TestBatchEnvIntegration:
         env.close()
 
 
+class TestBatchEnvPublicAPI:
+    """Verify all public properties of BatchGenesisMemoryMazeEnv."""
+
+    def test_action_space(self, _init_genesis):
+        env = BatchGenesisMemoryMazeEnv(n_envs=2, maze_size=9, seed=42,
+                                         camera_resolution=32)
+        assert env.action_space.n == 6
+        assert env.action_space.sample() in range(6)
+        env.close()
+
+    def test_observation_space(self, _init_genesis):
+        env = BatchGenesisMemoryMazeEnv(n_envs=2, maze_size=9, seed=42,
+                                         camera_resolution=32)
+        assert env.observation_space.shape == (32, 32, 3)
+        assert env.observation_space.dtype == np.uint8
+        assert env.observation_space.low.min() == 0
+        assert env.observation_space.high.max() == 255
+        env.close()
+
+    def test_observation_space_hd(self, _init_genesis):
+        env = BatchGenesisMemoryMazeEnv(n_envs=1, maze_size=9, seed=42,
+                                         camera_resolution=64)
+        assert env.observation_space.shape == (64, 64, 3)
+        env.close()
+
+    def test_n_envs(self, _init_genesis):
+        env = BatchGenesisMemoryMazeEnv(n_envs=3, maze_size=9, seed=42,
+                                         camera_resolution=32)
+        assert env.n_envs == 3
+        env.close()
+
+
 # ===================================================================
 # Smoke: Training loop simulation (slow)
 # ===================================================================

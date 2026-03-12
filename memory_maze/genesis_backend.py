@@ -1625,6 +1625,11 @@ class BatchGenesisMemoryMazeEnv:
     def action_space(self):
         return spaces.Discrete(6)
 
+    @property
+    def observation_space(self):
+        res = self._camera_resolution
+        return spaces.Box(0, 255, (res, res, 3), dtype=np.uint8)
+
     def reset(self):
         """Reset all environments. Returns observations (n_envs, H, W, 3)."""
         for i in range(self._n_envs):
