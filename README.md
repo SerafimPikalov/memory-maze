@@ -244,11 +244,16 @@ Genesis single-env defaults to CPU backend. For GPU physics, call `gs.init(backe
 
 Physics timestep `dt=0.05` is recommended for Genesis (10x fewer substeps than the default `dt=0.005`), giving substantial physics speedup with stable walker dynamics.
 
+### When to Use Batched Mode
+
+Use `BatchGenesisMemoryMazeEnv` for **training** — it runs all environments in a single GPU process with shared physics and rendering, giving ~4ms/env amortized (vs ~49ms for single-env). Use single-env `GenesisMemoryMazeEnv` for **evaluation, debugging, and interactive use**.
+
 ### Known Limitations
 
 - Genesis backend still requires `dm_control` installed (for `labmaze` maze generation)
 - `gs-madrona` must be built from source for correct rendering (PyPI version has sRGB overflow bug)
-- `BatchGenesisMemoryMazeEnv` is not a `gym.Env` -- it exposes a custom vectorized interface with auto-reset semantics
+- `BatchGenesisMemoryMazeEnv` is not a `gym.Env` — it exposes a custom vectorized interface with auto-reset semantics
+- Batched mode does not support `-Top` (top-down camera) or `-ExtraObs` (debug observations) variants
 
 ## Offline Dataset
 
