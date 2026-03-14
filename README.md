@@ -242,7 +242,13 @@ pytest tests/ -v
 
 Genesis single-env defaults to CPU backend. For GPU physics, call `gs.init(backend=gs.cuda)` before creating the environment. The batched environment (`BatchGenesisMemoryMazeEnv`) requires CUDA and automatically uses GPU physics.
 
-Physics timestep `dt=0.05` is recommended for Genesis (10x fewer substeps than the default `dt=0.005`), giving substantial physics speedup with stable walker dynamics.
+Physics timestep `dt=0.05` is recommended for Genesis (10x fewer substeps than the default `dt=0.005`), giving ~10x physics speedup with stable walker dynamics. Pass it as a constructor argument:
+
+```python
+env = GenesisMemoryMazeEnv(maze_size=9, physics_timestep=0.05)
+# or batched:
+env = BatchGenesisMemoryMazeEnv(n_envs=32, maze_size=9, physics_timestep=0.05)
+```
 
 ### When to Use Batched Mode
 
