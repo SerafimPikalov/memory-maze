@@ -1,4 +1,4 @@
-"""Shared fixtures for Memory Maze Genesis backend tests."""
+"""Shared fixtures for Memory Maze tests."""
 
 import os
 import sys
@@ -18,19 +18,22 @@ def pytest_addoption(parser):
     parser.addoption("--physics-timestep", type=float, default=None,
                      help="Override Genesis physics timestep (default: 0.005)")
 
-# Skip entire test module if Genesis is not installed
+# Genesis is optional — individual test files that need it have their own
+# pytestmark skip markers.  Do NOT add a module-level pytestmark here,
+# because conftest.py is loaded for ALL tests in this directory.
 try:
     import genesis as gs
     HAS_GENESIS = True
 except ImportError:
     HAS_GENESIS = False
-
-pytestmark = pytest.mark.skipif(not HAS_GENESIS, reason="Genesis not installed")
+    gs = None  # avoid NameError in init_genesis fixture guard
 
 
 @pytest.fixture(scope="session")
 def init_genesis():
     """Initialize Genesis once per test session."""
+    if gs is None:
+        pytest.skip("Genesis not installed")
     if not gs._initialized:
         gs.init(backend=gs.cpu, logging_level="warning")
     return gs

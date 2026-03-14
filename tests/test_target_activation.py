@@ -1,12 +1,14 @@
-"""Targeted tests for Tasks 20-23 changes.
+"""Tests for target activation distance, gym env rewards, and seeded reproducibility.
 
-Task 20: TARGET_ACTIVATION_GAP = 0.8m (was 1.2m)
-Task 21: grad_norm captured in learn()
-Task 22: episodes_per_batch metric added
-Task 23: create_env() passes seed to gym.make()
+Covers:
+- TARGET_ACTIVATION_GAP = 0.8m (WALKER_RADIUS + TARGET_RADIUS)
+- Boundary-condition contact checks at various distances
+- Binary reward invariant (0.0 or 1.0)
+- Seeded reproducibility across env instances
+- Training script metric instrumentation (source code checks)
 
 Run:
-    pytest memory-maze/tests/test_task20_24_changes.py -v
+    pytest memory-maze/tests/test_target_activation.py -v
 """
 
 import math
@@ -53,7 +55,7 @@ def scene(_init_genesis):
 
 
 # ===================================================================
-# Task 20: TARGET_ACTIVATION_GAP value
+# Activation gap value and boundary tests
 # ===================================================================
 
 class TestActivationGap:
@@ -64,7 +66,7 @@ class TestActivationGap:
         assert TARGET_ACTIVATION_GAP == pytest.approx(0.8)
 
     def test_contact_at_0_7m(self, scene):
-        """Walker at 0.7m from target center → should activate (0.7 < 0.8)."""
+        """Walker at 0.7m from target center should activate (0.7 < 0.8)."""
         rng = np.random.RandomState(42)
         scene.reset(rng)
 
@@ -82,7 +84,7 @@ class TestActivationGap:
         assert contacts[0], "Should activate at 0.7m (< 0.8m threshold)"
 
     def test_no_contact_at_0_9m(self, scene):
-        """Walker at 0.9m from target center → should NOT activate (0.9 > 0.8)."""
+        """Walker at 0.9m from target center should NOT activate (0.9 > 0.8)."""
         rng = np.random.RandomState(42)
         scene.reset(rng)
 
@@ -98,7 +100,7 @@ class TestActivationGap:
         assert not contacts[0], "Should NOT activate at 0.9m (> 0.8m threshold)"
 
     def test_contact_boundary_just_inside(self, scene):
-        """Walker at 0.79m → should activate."""
+        """Walker at 0.79m should activate."""
         rng = np.random.RandomState(42)
         scene.reset(rng)
 
@@ -111,7 +113,7 @@ class TestActivationGap:
         assert contacts[0], "Should activate at 0.79m (< 0.8m)"
 
     def test_contact_boundary_just_outside(self, scene):
-        """Walker at 0.81m → should NOT activate."""
+        """Walker at 0.81m should NOT activate."""
         rng = np.random.RandomState(42)
         scene.reset(rng)
 
@@ -123,8 +125,8 @@ class TestActivationGap:
         contacts = scene.check_target_contacts(np.array([0.0, 0.0, WALKER_RADIUS]))
         assert not contacts[0], "Should NOT activate at 0.81m (> 0.8m)"
 
-    def test_old_gap_1_2m_would_have_activated(self, scene):
-        """At 1.1m, old gap (1.2) would activate but new gap (0.8) should not."""
+    def test_old_gap_would_have_activated(self, scene):
+        """At 1.1m, the original 1.2m gap would activate but 0.8m should not."""
         rng = np.random.RandomState(42)
         scene.reset(rng)
 
@@ -136,7 +138,7 @@ class TestActivationGap:
         contacts = scene.check_target_contacts(np.array([0.0, 0.0, WALKER_RADIUS]))
         assert not contacts[0], (
             "At 1.1m should NOT activate with 0.8m gap "
-            "(old 1.2m gap would have incorrectly activated)"
+            "(original 1.2m gap would have incorrectly activated)"
         )
 
     def test_contact_uses_2d_distance(self, scene):
@@ -144,7 +146,7 @@ class TestActivationGap:
         rng = np.random.RandomState(42)
         scene.reset(rng)
 
-        # Walker and target at same XY but different Z → XY distance = 0.5
+        # Walker and target at same XY but different Z -> XY distance = 0.5
         walker_pos = np.array([0.0, 0.0, 0.2])
         target_pos = np.array([0.5, 0.0, 5.0])  # Z far away
         scene.target_entities[0].set_pos(target_pos)
@@ -168,7 +170,7 @@ class TestActivationGap:
 
 
 # ===================================================================
-# Task 20: Gym env reward with new activation distance
+# Gym env reward with activation distance
 # ===================================================================
 
 class TestGymEnvActivation:
@@ -189,11 +191,11 @@ class TestGymEnvActivation:
             assert r in (0.0, 1.0), f"Unexpected reward: {r}"
 
     def test_pick_new_target_respects_gap(self, _init_genesis):
-        """_pick_new_target should not pick a target within 0.8m of walker."""
+        """_pick_new_target should not pick a target within activation gap of walker."""
         env = GenesisMemoryMazeEnv(maze_size=9, camera_resolution=32, seed=42)
         env.reset()
 
-        # Call _pick_new_target many times; each chosen target should be >= 0.8m
+        # Call _pick_new_target many times; each chosen target should be >= gap
         walker_pos = env._scene.get_walker_position()
         for _ in range(50):
             env._pick_new_target()
@@ -207,7 +209,7 @@ class TestGymEnvActivation:
 
 
 # ===================================================================
-# Task 23: Seeded reproducibility
+# Seeded reproducibility
 # ===================================================================
 
 class TestSeededReproducibility:
@@ -239,7 +241,7 @@ class TestSeededReproducibility:
         assert diff > 1.0, f"Different seeds should produce different obs, diff={diff}"
 
     def test_same_seed_same_trajectory(self, _init_genesis):
-        """Same seed + same actions → identical reward sequence."""
+        """Same seed + same actions should produce identical reward sequence."""
         actions = [1, 1, 1, 2, 1, 1, 3, 1, 1, 1]  # fixed action sequence
         reward_sequences = []
         for _ in range(2):
@@ -293,11 +295,11 @@ class TestSeededReproducibility:
 
 
 # ===================================================================
-# Task 21-22: Training metrics (source code checks)
+# Training metrics (source code checks)
 # ===================================================================
 
 class TestTrainingMetricsCode:
-    """Verify train_impala.py source has the required metric changes.
+    """Verify train_impala.py source has the required metric instrumentation.
 
     These can't be tested by running learn() without a full IMPALA setup,
     so we check the source code directly.

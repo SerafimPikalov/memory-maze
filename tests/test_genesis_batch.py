@@ -953,7 +953,7 @@ class TestBatchedContactBoundary:
 
     The batched step() has its own contact detection code (inline Python
     loops, NOT calling check_target_contacts), so it needs independent
-    boundary validation matching test_task20_24_changes.py.
+    boundary validation matching test_target_activation.py.
 
     Uses a single shared env (class-scoped) to avoid Genesis/pyglet resource
     exhaustion from creating many scenes sequentially.

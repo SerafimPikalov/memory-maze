@@ -4,7 +4,7 @@
 
 # Memory Maze
 
-Memory Maze is a 3D domain of randomized mazes designed for evaluating the long-term memory abilities of RL agents. Memory Maze isolates long-term memory from confounding challenges, such as exploration, and requires remembering several pieces of information: the positions of objects, the wall layout, and keeping track of agent’s own position.
+Memory Maze is a 3D domain of randomized mazes designed for evaluating the long-term memory abilities of RL agents. Memory Maze isolates long-term memory from confounding challenges, such as exploration, and requires remembering several pieces of information: the positions of objects, the wall layout, and keeping track of agent's own position.
 
 | Memory 9x9 | Memory 11x11 | Memory 13x13 | Memory 15x15 |
 |------------|--------------|--------------|--------------|
@@ -89,7 +89,7 @@ You can create the environment using the [Gym](https://github.com/openai/gym) in
 import gym
 
 # Set this if you are getting "Unable to load EGL library" error:
-#  os.environ['MUJOCO_GL'] = 'glfw'  
+#  os.environ['MUJOCO_GL'] = 'glfw'
 
 env = gym.make('memory_maze:MemoryMaze-9x9-v0')
 env = gym.make('memory_maze:MemoryMaze-11x11-v0')
@@ -97,7 +97,7 @@ env = gym.make('memory_maze:MemoryMaze-13x13-v0')
 env = gym.make('memory_maze:MemoryMaze-15x15-v0')
 ```
 
-**Troubleshooting:** if you are getting "Unable to load EGL library error", that is because we enable MuJoCo headless GPU rendering (`MUJOCO_GL=egl`) by default. If you are testing locally on your machine, you can enable windowed rendering instead (`MUJOCO_GL=glfw`). [Read here](https://github.com/deepmind/dm_control#rendering) about the different rendering options. 
+**Troubleshooting:** if you are getting "Unable to load EGL library error", that is because we enable MuJoCo headless GPU rendering (`MUJOCO_GL=egl`) by default. If you are testing locally on your machine, you can enable windowed rendering instead (`MUJOCO_GL=glfw`). [Read here](https://github.com/deepmind/dm_control#rendering) about the different rendering options.
 
 The default environment has 64x64 image observations:
 
@@ -119,7 +119,7 @@ To create an environment with extra observations for debugging and probe analysi
 >>> env = gym.make('memory_maze:MemoryMaze-9x9-ExtraObs-v0')
 >>> env.observation_space
 Dict(
-    agent_dir: Box(-inf, inf, (2,), float64), 
+    agent_dir: Box(-inf, inf, (2,), float64),
     agent_pos: Box(-inf, inf, (2,), float64),
     image: Box(0, 255, (64, 64, 3), uint8),
     maze_layout: Box(0, 1, (9, 9), uint8),
@@ -167,6 +167,88 @@ env = tasks.memory_maze_9x9(
     discrete_actions=True,
 )
 ```
+
+## Genesis Backend
+
+Memory Maze supports [Genesis](https://github.com/Genesis-Embodied-AI/Genesis) as an alternative physics backend, enabling GPU-accelerated batched simulation. The Genesis backend implements the same `gym.Env` interface (same observation and action spaces) and uses `labmaze` for maze generation, so mazes are structurally identical to the MuJoCo originals.
+
+### Installation
+
+Genesis is an optional dependency. Install it alongside Memory Maze:
+
+```sh
+pip install genesis-world
+pip install -e .
+```
+
+Genesis environments are registered automatically when Genesis is importable. To disable auto-registration (e.g., on machines where Genesis import is slow), set `MEMORY_MAZE_DISABLE_GENESIS=1`.
+
+For batched rendering with Madrona BatchRenderer, `gs-madrona` must be built from source with the uint8 clamp fix (the stock PyPI version has a color overflow bug that turns yellow walls green):
+
+```sh
+# See https://github.com/Genesis-Embodied-AI/gs-madrona for build instructions
+# Required fix: clamp(srgb, 0.0f, 1.0f) in linearToSRGB8() before uint8 cast
+```
+
+### Quick Start
+
+```python
+import gym
+import memory_maze
+
+# Single environment (uses Gym interface, same as MuJoCo variant)
+env = gym.make("memory_maze:MemoryMaze-9x9-Genesis-v0")
+obs = env.reset()
+obs, reward, done, info = env.step(env.action_space.sample())
+
+# Batched environment (GPU physics + Madrona BatchRenderer)
+from memory_maze.genesis_backend import BatchGenesisMemoryMazeEnv
+env = BatchGenesisMemoryMazeEnv(n_envs=32, maze_size=9)
+obs = env.reset()  # shape: (32, 64, 64, 3)
+obs, reward, done, info = env.step([env.action_space.sample() for _ in range(32)])
+```
+
+All MuJoCo environment variants have Genesis equivalents. Append `-Genesis` before `-v0`:
+
+| MuJoCo | Genesis |
+|--------|---------|
+| `MemoryMaze-9x9-v0` | `MemoryMaze-9x9-Genesis-v0` |
+| `MemoryMaze-9x9-ExtraObs-v0` | `MemoryMaze-9x9-ExtraObs-Genesis-v0` |
+| `MemoryMaze-9x9-HD-v0` | `MemoryMaze-9x9-HD-Genesis-v0` |
+| `MemoryMaze-9x9-Top-v0` | `MemoryMaze-9x9-Top-Genesis-v0` |
+
+The same pattern applies for 11x11, 13x13, and 15x15 sizes.
+
+### Running Tests
+
+```sh
+# Cross-backend parity tests (requires both MuJoCo and Genesis)
+MUJOCO_GL=glfw pytest tests/test_cross_backend_walker.py -v
+
+# Genesis batched environment tests (requires CUDA GPU)
+pytest tests/test_genesis_batch.py -v
+
+# All Genesis tests skip gracefully if Genesis is not installed
+pytest tests/ -v
+```
+
+### Performance
+
+| Backend | Mode | Step Time | Notes |
+|---------|------|-----------|-------|
+| MuJoCo | Single env | ~12ms | CPU physics + EGL rendering |
+| Genesis | Single env (CPU) | ~49ms | CPU physics, OpenGL rasterizer |
+| Genesis | Batched (GPU) | ~4ms/env | GPU physics + BatchRenderer, amortized over 32 envs |
+
+Genesis single-env defaults to CPU backend. For GPU physics, call `gs.init(backend=gs.cuda)` before creating the environment. The batched environment (`BatchGenesisMemoryMazeEnv`) requires CUDA and automatically uses GPU physics.
+
+Physics timestep `dt=0.05` is recommended for Genesis (10x fewer substeps than the default `dt=0.005`), giving substantial physics speedup with stable walker dynamics.
+
+### Known Limitations
+
+- Genesis backend still requires `dm_control` installed (for `labmaze` maze generation)
+- `gs-madrona` must be built from source for correct rendering (PyPI version has sRGB overflow bug)
+- `BatchGenesisMemoryMazeEnv` is not a `gym.Env` -- it exposes a custom vectorized interface with auto-reset semantics
 
 ## Offline Dataset
 

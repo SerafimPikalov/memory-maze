@@ -1,14 +1,24 @@
-"""
-Genesis physics backend for Memory Maze.
+"""Genesis physics backend for Memory Maze.
 
-Replaces the MuJoCo/dm_control stack with Genesis for GPU-accelerated
-physics and rendering. Implements the same gym.Env interface.
+Provides two environment classes:
+
+- GenesisMemoryMazeEnv: Single-environment gym.Env using Genesis physics
+  (CPU by default, GPU if gs.init(backend=gs.gpu) is called first).
+- BatchGenesisMemoryMazeEnv: Batched vectorized environment using Genesis
+  GPU physics and Madrona BatchRenderer for parallel rendering.
+
+Dependencies:
+  - genesis-world >= 0.4.0
+  - gs-madrona (built from source with uint8 clamp fix) for BatchRenderer
+  - dm_control (for labmaze maze generation)
+
+See README for installation and build instructions.
 """
 
 import logging
 import math
 import os
-import time as _time
+import time
 from collections import namedtuple
 
 # Prevent matplotlib (imported by Genesis) from initializing Tk, which
@@ -36,7 +46,10 @@ except ImportError:
     gym = None
     spaces = None
 
-# BatchRenderer (Madrona) availability detection — CUDA-only, Linux x86-64
+# BatchRenderer (Madrona) availability detection — CUDA-only, Linux x86-64.
+# NOTE: Stock PyPI gs-madrona (0.0.7.post2) has a sRGB uint8 overflow bug
+# that causes yellow walls to render green. Build from source with the clamp fix.
+# See README for build instructions.
 try:
     import gs_madrona
     _BATCH_RENDERER_AVAILABLE = True
@@ -50,6 +63,14 @@ def _use_batch_renderer():
             and gs is not None
             and gs._initialized
             and gs.device.type == 'cuda')
+
+__all__ = [
+    'GenesisMemoryMazeEnv',
+    'BatchGenesisMemoryMazeEnv',
+    'GenesisMazeScene',
+    'BatchGenesisMazeScene',
+    'register_genesis_envs',
+]
 
 # ---------------------------------------------------------------------------
 # Constants from the MuJoCo reference implementation (maze.py, tasks.py)
@@ -365,11 +386,13 @@ class _BaseMazeScene:
         max_collision_pairs=None,
         top_camera=False,
         randomize_colors=False,
+        use_batch_renderer=None,
     ):
         if gs is None:
             raise ImportError("Genesis is not installed. Install with: pip install genesis-world")
 
         self._n_envs = n_envs
+        self._use_batch_renderer = use_batch_renderer
         self.maze_size = maze_size
         self.n_targets = n_targets
         self.xy_scale = xy_scale
@@ -389,12 +412,15 @@ class _BaseMazeScene:
         self.outer_size = maze_size + 2
 
         _log = logging.getLogger("genesis_backend")
-        _t0 = _time.monotonic()
+        _t0 = time.monotonic()
         def _elapsed():
-            return f"{_time.monotonic() - _t0:.1f}s"
+            return f"{time.monotonic() - _t0:.1f}s"
 
         # --- Renderer ---
-        if _use_batch_renderer():
+        _want_batch = (self._use_batch_renderer
+                       if self._use_batch_renderer is not None
+                       else _use_batch_renderer())
+        if _want_batch:
             renderer = gs.renderers.BatchRenderer(use_rasterizer=True)
         else:
             renderer = gs.renderers.Rasterizer()
@@ -412,7 +438,7 @@ class _BaseMazeScene:
             lights=_CARDINAL_LIGHTS_VIS,
         )
         if n_envs > 0:
-            vis_opts['env_separate_rigid'] = not _use_batch_renderer()
+            vis_opts['env_separate_rigid'] = not _want_batch
 
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(
@@ -426,7 +452,7 @@ class _BaseMazeScene:
         )
 
         # BatchRenderer requires explicit lights (Rasterizer uses VisOptions.lights)
-        if _use_batch_renderer():
+        if _want_batch:
             for ldef in _CARDINAL_LIGHTS_BATCH:
                 self.scene.add_light(**ldef)
 
@@ -583,13 +609,13 @@ class _BaseMazeScene:
     def build(self):
         """Build the Genesis scene. Must be called once before stepping."""
         _log = logging.getLogger("genesis_backend")
-        _t0 = _time.monotonic()
+        _t0 = time.monotonic()
         if self._n_envs > 0:
             _log.info("[0.0s] scene.build(n_envs=%d) starting...", self._n_envs)
             self.scene.build(n_envs=self._n_envs)
         else:
             self.scene.build()
-        _log.info("[%.1fs] scene.build() complete", _time.monotonic() - _t0)
+        _log.info("[%.1fs] scene.build() complete", time.monotonic() - _t0)
         self._built = True
 
         # Configure walker DOF damping after build
@@ -599,7 +625,7 @@ class _BaseMazeScene:
             TRANS_DAMPING, TRANS_DAMPING, 0.0,
             ROLL_DAMPING, ROLL_DAMPING, STEER_DAMPING,
         ]))
-        _log.info("[%.1fs] Walker damping configured. Build done.", _time.monotonic() - _t0)
+        _log.info("[%.1fs] Walker damping configured. Build done.", time.monotonic() - _t0)
 
     def shuffled_wall_groups(self, rng):
         """Return a shuffled copy of wall_groups (does not mutate shared state)."""
@@ -693,6 +719,7 @@ class GenesisMazeScene(_BaseMazeScene):
         texture_seed=None,
         top_camera=False,
         randomize_colors=False,
+        use_batch_renderer=None,
     ):
         super().__init__(
             maze_size=maze_size, n_targets=n_targets, xy_scale=xy_scale,
@@ -704,6 +731,7 @@ class GenesisMazeScene(_BaseMazeScene):
             use_textures=use_textures, texture_seed=texture_seed,
             n_envs=0,
             top_camera=top_camera, randomize_colors=randomize_colors,
+            use_batch_renderer=use_batch_renderer,
         )
         # State tracking (single-env specific)
         self._maze = None
@@ -897,6 +925,8 @@ class GenesisMazeScene(_BaseMazeScene):
 
     def render_egocentric(self):
         """Render egocentric camera view. Returns uint8 numpy [H, W, 3]."""
+        # force_render=True is CRITICAL: BatchRenderer caches frames by scene.t.
+        # After camera.set_pose() without scene.step(), the cache returns a stale frame.
         result = self.camera.render(rgb=True, depth=False, segmentation=False, force_render=True)
         # render() returns a tuple: (rgb, depth, segmentation, normal)
         return np.asarray(_to_numpy(result[0]), dtype=np.uint8)
@@ -1009,6 +1039,9 @@ class GenesisMemoryMazeEnv(gym.Env):
     - observation_space: Box(0, 255, (resolution, resolution, 3), uint8)
     - reset() -> obs (HWC uint8)
     - step(action) -> (obs, reward, done, info)
+
+    Note: Without ``use_batch_renderer``, Genesis defaults to CPU backend.
+    For GPU physics, call ``gs.init(backend=gs.gpu)`` before creating the env.
     """
 
     metadata = {'render.modes': ['rgb_array']}
@@ -1106,6 +1139,7 @@ class GenesisMemoryMazeEnv(gym.Env):
             texture_seed=seed,
             top_camera=top_camera,
             randomize_colors=randomize_colors,
+            use_batch_renderer=use_batch_renderer,
         )
         self._scene.build()
 
@@ -1302,7 +1336,6 @@ class GenesisMemoryMazeEnv(gym.Env):
 # Phase 5: Batched Scene Builder (inherits from _BaseMazeScene)
 # ---------------------------------------------------------------------------
 
-# Backward-compatible alias — batch code and tests reference this.
 BATCH_HIDDEN_Z = HIDDEN_Z
 
 
@@ -1347,7 +1380,10 @@ class BatchGenesisMazeScene(_BaseMazeScene):
 
     def _setup_camera(self):
         """Batch-env: BatchRenderer gets one camera, Rasterizer gets N cameras."""
-        if _use_batch_renderer():
+        _want_batch = (self._use_batch_renderer
+                       if self._use_batch_renderer is not None
+                       else _use_batch_renderer())
+        if _want_batch:
             self.camera = self.scene.add_camera(
                 res=(self.camera_resolution, self.camera_resolution),
                 pos=(0, 0, WALKER_CAMERA_HEIGHT + WALKER_RADIUS),
@@ -1453,7 +1489,7 @@ class BatchGenesisMazeScene(_BaseMazeScene):
         cam_positions = np.stack([cam_x, cam_y, cam_z], axis=-1)  # (n_envs, 3)
 
         look_dist = _CAMERA_LOOK_DIST
-        looktats = np.stack([
+        lookats = np.stack([
             cam_x + look_dist * np.cos(headings),
             cam_y + look_dist * np.sin(headings),
             cam_z - _CAMERA_LOOKAT_DOWN,
@@ -1463,11 +1499,11 @@ class BatchGenesisMazeScene(_BaseMazeScene):
         up[:, 2] = 1.0
         if self.camera is not None:
             # BatchRenderer: single vectorized call
-            self.camera.set_pose(pos=cam_positions, lookat=looktats, up=up)
+            self.camera.set_pose(pos=cam_positions, lookat=lookats, up=up)
         else:
             # Rasterizer: per-env loop
             for i in range(self.n_envs):
-                self.cameras[i].set_pose(pos=cam_positions[i], lookat=looktats[i], up=up[i])
+                self.cameras[i].set_pose(pos=cam_positions[i], lookat=lookats[i], up=up[i])
 
     def render_all(self):
         """Render egocentric views for all environments.
@@ -1512,6 +1548,8 @@ class BatchGenesisMazeScene(_BaseMazeScene):
         resetting one env doesn't rewind the clock for all other envs.
         """
         idx_tensor = torch.tensor([env_idx], dtype=torch.int32)
+        # Genesis scene.reset() resets _t to 0. For per-env reset in batched mode,
+        # we must preserve the global time counter. No public setter exists (as of v0.4.0).
         saved_t = self.scene._t
         self.scene.reset(envs_idx=idx_tensor)
         self.scene._t = saved_t

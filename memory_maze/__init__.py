@@ -64,7 +64,7 @@ except ImportError:
     raise
 
 # Register Genesis-backed environments (separate try block — Genesis is optional).
-# Uses subprocess probe: Genesis imports Taichi (quadrants) which compiles native
+# Uses subprocess probe: Genesis compiles native
 # extensions requiring AVX2. On older CPUs (e.g. Sandy Bridge with only AVX),
 # this triggers SIGILL which cannot be caught by try/except.
 if os.environ.get('MEMORY_MAZE_DISABLE_GENESIS') != '1':

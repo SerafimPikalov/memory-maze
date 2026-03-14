@@ -1,8 +1,30 @@
-.*
-!.gitignore
-
+# Python
 __pycache__/
-*.egg-info
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
 
-sandbox/
-log/
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+*.mp4
+*.npz
+visual_test/
+compare_frames/
+recordings/
+
+# Project-internal files (not for public fork)
+CLAUDE.md
+docs/analysis/architecture_report.md
+docs/analysis/review_*.md
+docs/challenges/
