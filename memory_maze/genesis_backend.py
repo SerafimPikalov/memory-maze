@@ -984,9 +984,14 @@ def _pick_new_target(rng, current_ix, target_positions, walker_pos,
         dist = np.linalg.norm(walker_pos[:2] - target_positions[candidate][:2])
         if dist >= activation_gap:
             return candidate
-    fallback = (current_ix + 1) % n_targets
-    logging.warning("_pick_new_target: all targets within activation gap, using fallback")
-    return fallback
+    # Fallback: pick next above-ground target
+    for offset in range(1, n_targets):
+        candidate = (current_ix + offset) % n_targets
+        if target_positions[candidate][2] >= _UNDERGROUND_THRESHOLD:
+            logging.warning("_pick_new_target: using fallback target %d", candidate)
+            return candidate
+    logging.warning("_pick_new_target: all targets underground or within gap, reusing current")
+    return current_ix
 
 
 def _regenerate_maze(maze, rng, use_textures, xy_scale, z_height, wall_groups_source):
