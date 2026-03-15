@@ -979,6 +979,8 @@ def _pick_new_target(rng, current_ix, target_positions, walker_pos,
         candidate = rng.randint(0, n_targets)
         if candidate == current_ix:
             continue
+        if target_positions[candidate][2] < _UNDERGROUND_THRESHOLD:
+            continue
         dist = np.linalg.norm(walker_pos[:2] - target_positions[candidate][:2])
         if dist >= activation_gap:
             return candidate
